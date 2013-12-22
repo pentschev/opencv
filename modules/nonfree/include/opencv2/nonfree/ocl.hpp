@@ -50,6 +50,140 @@ namespace cv
 {
     namespace ocl
     {
+        ////////////////////////////////// SIFT //////////////////////////////////
+        class CV_EXPORTS SIFT_OCL
+        {
+        public:
+            enum
+            {
+                X_ROW = 0,
+                Y_ROW,
+                RESPONSE_ROW,
+                ANGLE_ROW,
+                OCTAVE_ROW,
+                SIZE_ROW,
+                ROWS_COUNT
+            };
+
+            //! Constructor
+            explicit SIFT_OCL(int nfeatures = 0, int nOctaveLayers = 3,
+                              double contrastThreshold = 0.04, double edgeThreshold = 10,
+                              double sigma = 1.6);
+
+            //! returns the descriptor size in floats (128)
+            int descriptorSize() const;
+
+            //! returns the descriptor type
+            int descriptorType() const;
+
+            //! returns the default norm type
+            int defaultNorm() const;
+
+            //! finds the keypoints using SIFT algorithm
+            void operator()(oclMat& img, oclMat& mask,
+                            std::vector<KeyPoint>& keypoints) const;
+
+            void buildGaussianPyramid(const oclMat& base, std::vector<oclMat>& pyr, int nOctaves) const;
+            void buildDoGPyramid(const std::vector<oclMat>& pyr, std::vector<oclMat>& dogpyr) const;
+//            void findScaleSpaceExtrema(const std::vector<oclMat>& gauss_pyr, const std::vector<oclMat>& dog_pyr,
+//                                       std::vector<KeyPoint>& keypoints) const;
+            void findScaleSpaceExtrema(const std::vector<oclMat>& gauss_pyr, const std::vector<oclMat>& dog_pyr,
+                                       oclMat& keypoints) const;
+
+//            //! finds the keypoints and computes descriptors for them using SIFT algorithm.
+//            //! Optionally it can compute descriptors for the user-provided keypoints
+//            void operator()(oclMat& img, oclMat& mask,
+//                            std::vector<KeyPoint>& keypoints,
+//                            const oclMat& descriptors = oclMat(),
+//                            bool useProvidedKeypoints = false) const;
+
+//            //! Compute the ORB features on an image
+//            //! image - the image to compute the features (supports only CV_8UC1 images)
+//            //! mask - the mask to apply
+//            //! keypoints - the resulting keypoints
+//            void operator ()(const oclMat& image, const oclMat& mask, std::vector<KeyPoint>& keypoints);
+//            void operator ()(const oclMat& image, const oclMat& mask, oclMat& keypoints);
+//
+//            //! Compute the ORB features and descriptors on an image
+//            //! image - the image to compute the features (supports only CV_8UC1 images)
+//            //! mask - the mask to apply
+//            //! keypoints - the resulting keypoints
+//            //! descriptors - descriptors array
+//            void operator ()(const oclMat& image, const oclMat& mask, std::vector<KeyPoint>& keypoints, oclMat& descriptors);
+//            void operator ()(const oclMat& image, const oclMat& mask, oclMat& keypoints, oclMat& descriptors);
+//
+//            //! download keypoints from device to host memory
+//            static void downloadKeyPoints(const oclMat& d_keypoints, std::vector<KeyPoint>& keypoints);
+//            //! convert keypoints to KeyPoint vector
+//            static void convertKeyPoints(const Mat& d_keypoints, std::vector<KeyPoint>& keypoints);
+//
+//            //! returns the descriptor size in bytes
+//            inline int descriptorSize() const { return kBytes; }
+//            inline int descriptorType() const { return CV_8U; }
+//            inline int defaultNorm() const { return NORM_HAMMING; }
+//
+//            inline void setFastParams(int threshold, bool nonmaxSupression = true)
+//            {
+//                fastDetector_.threshold = threshold;
+//                fastDetector_.nonmaxSupression = nonmaxSupression;
+//            }
+//
+//            //! release temporary buffer's memory
+//            void release();
+//
+//            //! if true, image will be blurred before descriptors calculation
+//            bool blurForDescriptor;
+
+        private:
+            int nfeatures;
+            int nOctaveLayers;
+            double contrastThreshold;
+            double edgeThreshold;
+            double sigma;
+            double keypointsRatio;
+
+//            enum { kBytes = 32 };
+//
+//            void buildScalePyramids(const oclMat& image, const oclMat& mask);
+//
+//            void computeKeyPointsPyramid();
+//
+//            void computeDescriptors(oclMat& descriptors);
+//
+//            void mergeKeyPoints(oclMat& keypoints);
+//
+//            int nFeatures_;
+//            float scaleFactor_;
+//            int nLevels_;
+//            int edgeThreshold_;
+//            int firstLevel_;
+//            int WTA_K_;
+//            int scoreType_;
+//            int patchSize_;
+//
+//            // The number of desired features per scale
+//            std::vector<size_t> n_features_per_level_;
+//
+//            // Points to compute BRIEF descriptors from
+//            oclMat pattern_;
+//
+//            std::vector<oclMat> imagePyr_;
+//            std::vector<oclMat> maskPyr_;
+//
+//            oclMat buf_;
+//
+//            std::vector<oclMat> keyPointsPyr_;
+//            std::vector<int> keyPointsCount_;
+//
+//            FAST_OCL fastDetector_;
+//
+//            Ptr<ocl::FilterEngine_GPU> blurFilter;
+//
+//            oclMat d_keypoints_;
+//
+//            oclMat uMax_;
+        };
+
         //! Speeded up robust features, port from CUDA module.
         ////////////////////////////////// SURF //////////////////////////////////////////
 
