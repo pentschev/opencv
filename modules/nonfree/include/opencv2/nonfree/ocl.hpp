@@ -58,6 +58,7 @@ namespace cv
             {
                 X_ROW = 0,
                 Y_ROW,
+                LAYER_ROW,
                 RESPONSE_ROW,
                 ANGLE_ROW,
                 OCTAVE_ROW,
@@ -68,7 +69,7 @@ namespace cv
             //! Constructor
             explicit SIFT_OCL(int nfeatures = 0, int nOctaveLayers = 3,
                               double contrastThreshold = 0.04, double edgeThreshold = 10,
-                              double sigma = 1.6);
+                              double sigma = 1.6, double keypointsRatio = 0.03);
 
             //! returns the descriptor size in floats (128)
             int descriptorSize() const;
@@ -80,15 +81,18 @@ namespace cv
             int defaultNorm() const;
 
             //! finds the keypoints using SIFT algorithm
-            void operator()(oclMat& img, oclMat& mask,
-                            std::vector<KeyPoint>& keypoints) const;
+            void operator()(const oclMat& img, const oclMat& mask,
+                            std::vector<KeyPoint>& keypoints);
+            void operator()(const oclMat& img, const oclMat& mask,
+                            oclMat& keypoints);
 
             void buildGaussianPyramid(const oclMat& base, std::vector<oclMat>& pyr, int nOctaves) const;
             void buildDoGPyramid(const std::vector<oclMat>& pyr, std::vector<oclMat>& dogpyr) const;
 //            void findScaleSpaceExtrema(const std::vector<oclMat>& gauss_pyr, const std::vector<oclMat>& dog_pyr,
 //                                       std::vector<KeyPoint>& keypoints) const;
             void findScaleSpaceExtrema(const std::vector<oclMat>& gauss_pyr, const std::vector<oclMat>& dog_pyr,
-                                       oclMat& keypoints) const;
+                                       const oclMat& mask, oclMat& keypoints, const int maxKeypoints,
+                                       const int firstOctave) const;
 
 //            //! finds the keypoints and computes descriptors for them using SIFT algorithm.
 //            //! Optionally it can compute descriptors for the user-provided keypoints
@@ -134,6 +138,9 @@ namespace cv
 //            //! if true, image will be blurred before descriptors calculation
 //            bool blurForDescriptor;
 
+            void downloadKeyPoints(const oclMat &d_keypoints, std::vector<KeyPoint>& keypoints);
+            void convertKeyPoints(const Mat &d_keypoints, std::vector<KeyPoint>& keypoints);
+
         private:
             int nfeatures;
             int nOctaveLayers;
@@ -141,6 +148,8 @@ namespace cv
             double edgeThreshold;
             double sigma;
             double keypointsRatio;
+
+            oclMat d_keypoints_;
 
 //            enum { kBytes = 32 };
 //
