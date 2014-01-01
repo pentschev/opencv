@@ -217,6 +217,13 @@ struct TSTestWithParam : public ::testing::TestWithParam<T>
         return border;
     }
 
+    Border randomEqBorder(int minValue = 0, int maxValue = MAX_VALUE)
+    {
+        int val = (int)randomDoubleLog(minValue, maxValue);
+        Border border = {val, val, val, val};
+        return border;
+    }
+
     void randomSubMat(Mat& whole, Mat& subMat, const Size& roiSize, const Border& border, int type, double minVal, double maxVal)
     {
         Size wholeSize = Size(roiSize.width + border.lef + border.rig, roiSize.height + border.top + border.bot);
