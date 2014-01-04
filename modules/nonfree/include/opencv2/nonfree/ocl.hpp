@@ -91,8 +91,8 @@ namespace cv
 //            void findScaleSpaceExtrema(const std::vector<oclMat>& gauss_pyr, const std::vector<oclMat>& dog_pyr,
 //                                       std::vector<KeyPoint>& keypoints) const;
             void findScaleSpaceExtrema(const std::vector<oclMat>& gauss_pyr, const std::vector<oclMat>& dog_pyr,
-                                       const oclMat& mask, oclMat& keypoints, const int maxKeypoints,
-                                       const int firstOctave) const;
+                                       const oclMat& mask, oclMat& keypoints, std::vector<int>& keypointsPerOctave,
+                                       const int maxKeypoints, const int firstOctave) const;
 
 //            //! finds the keypoints and computes descriptors for them using SIFT algorithm.
 //            //! Optionally it can compute descriptors for the user-provided keypoints

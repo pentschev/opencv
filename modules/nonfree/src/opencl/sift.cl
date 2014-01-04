@@ -42,6 +42,15 @@
 //
 //M*/
 
+// TODO
+//
+// 1) Vectorize implementation to reduce some clock cycles.
+// 2) Global memory has been used extensively due to the high amount of data, with careful evaluation
+// some parts of the algorithm might be implementable using local memory. One idea is to implement
+// the kernel in such a way that each work-group will process a small number of features at a time
+// (e.g., 1), but this has to be tested to evaluate if processing time results improve.
+
+
 #ifdef DOUBLE_SUPPORT
 #ifdef cl_amd_fp64
 #pragma OPENCL EXTENSION cl_amd_fp64:enable
@@ -81,6 +90,15 @@
 
 // orientation magnitude relative to max that results in new feature
 #define SIFT_ORI_PEAK_RATIO 0.8f
+
+// determines the size of a single descriptor orientation histogram
+#define SIFT_DESCR_SCL_FCTR 3.f
+
+// threshold on magnitude of elements of descriptor vector
+#define SIFT_DESCR_MAG_THR 0.2f
+
+// factor used to convert floating-point descriptor to unsigned char
+#define SIFT_INT_DESCR_FCTR 512.f
 
 //#ifdef CPU
 //void reduce_32(volatile __local int* smem, volatile int* val, int tid)
@@ -190,6 +208,23 @@ void reduce_36_fmax(__global float * data, int tid)
 #undef op
 }
 
+void atomic_add_local_float(volatile __local float *src, const float val) {
+    union {
+        unsigned int intVal;
+        float floatVal;
+    } newVal;
+
+    union {
+        unsigned int intVal;
+        float floatVal;
+    } prevVal;
+
+    do {
+        prevVal.floatVal = *src;
+        newVal.floatVal = prevVal.floatVal + val;
+    } while (atomic_cmpxchg((volatile __local unsigned int *)src, prevVal.intVal, newVal.intVal) != prevVal.intVal);
+}
+
 
 void atomic_add_global_float(volatile __global float *src, const float val) {
     union {
@@ -250,150 +285,222 @@ static void gaussian_elimination_with_pivoting(float* A,
 #undef AIDX
 }
 
-//__kernel
-//void calcSIFTDescriptor(__global const T* img,
-//                        __global const T* keypoints,
+__kernel
+void calcSIFTDescriptor(__global const T* layer1,
+                        __global const T* layer2,
+                        __global const T* layer3,
+                        __global const float* keypoints,
+                        __global float* descriptors,
+                        __global float* hist,
+                        const int n_octave_layers,
+                        const int keypoints_offset,
+                        const int total_keypoints,
+                        const int rows,
+                        const int cols,
+                        const int layer1_step,
+                        const int layer2_step,
+                        const int layer3_step,
+                        const int keypoints_step,
+                        const int descriptors_step,
+                        const int hist_step,
 //                        float ori, float scl,
-//                               int d, int n, float* dst )
-//{
-//    Point pt(cvRound(ptf.x), cvRound(ptf.y));
-//    float cos_t = cosf(ori*(float)(CV_PI/180));
-//    float sin_t = sinf(ori*(float)(CV_PI/180));
-//    float bins_per_rad = n / 360.f;
-//    float exp_scale = -1.f/(d * d * 0.5f);
-//    float hist_width = SIFT_DESCR_SCL_FCTR * scl;
-//    int radius = cvRound(hist_width * 1.4142135623730951f * (d + 1) * 0.5f);
-//    // Clip the radius to the diagonal of the image to avoid autobuffer too large exception
-//    radius = std::min(radius, (int) sqrt((double) img.cols*img.cols + img.rows*img.rows));
-//    cos_t /= hist_width;
-//    sin_t /= hist_width;
+                               int d, int n)
+{
+    const int hidx =  mad24(get_group_id(0), get_local_size(0), get_local_id(0));
+    const int kpidx = hidx + keypoints_offset;
+    const int lid_y = get_local_id(1);
+    const int lsz_y = get_local_size(1);
+
+    if (kpidx >= keypoints_offset+total_keypoints)
+        return;
+
+#define KPT(Y,X) keypoints[mad24(Y,keypoints_step,X)]
+#define HIST(Y,X) hist[mad24(Y,hist_step,X)]
+#define IMG(Y,X) img[mad24(Y,img_step,X)]
+#define DESC(Y,X) descriptors[mad24(Y,descriptors_step,X)]
+
+    const int pt_x = round(KPT(X_ROW, kpidx));
+    const int pt_y = round(KPT(Y_ROW, kpidx));
+    const int layer = round(KPT(LAYER_ROW, kpidx));
+    float angle = 360.f - KPT(ANGLE_ROW, kpidx);
+    if (fabs(angle - 360.f) < FLT_EPSILON)
+        angle = 0.f;
+    const float ori = angle;
+    const float size = KPT(SIZE_ROW, kpidx);
+    const float scl = size*0.5f;
+
+    // Points img to correct Gaussian pyramid layer
+    __global const T* img;
+    int img_step;
+
+    if (layer == 1)
+    {
+        img = layer1;
+        img_step = layer1_step;
+    }
+    else if (layer == 2)
+    {
+        img = layer2;
+        img_step = layer2_step;
+    }
+    else if (layer == 3)
+    {
+        img = layer3;
+        img_step = layer3_step;
+    }
+
+//    float cos_t = cos(ori*(float)(CV_PI/180));
+//    float sin_t = sin(ori*(float)(CV_PI/180));
+    float cos_t = cospi(ori/180.f);
+    float sin_t = sinpi(ori/180);
+    float bins_per_rad = n / 360.f;
+    float exp_scale = -1.f/(d * d * 0.5f);
+    float hist_width = SIFT_DESCR_SCL_FCTR * scl;
+    int radius = round(hist_width * 1.4142135623730951f * (d + 1) * 0.5f);
+
+    // Clip the radius to the diagonal of the image to avoid autobuffer too large exception
+    radius = min(radius, (int) sqrt((float) cols*cols + rows*rows));
+    cos_t /= hist_width;
+    sin_t /= hist_width;
+
+    int len = (radius*2+1), histlen = (d+2)*(d+2)*(n+2);
+
+    for (int i = lid_y; i < histlen; i += lsz_y)
+        HIST(hidx, i) = 0.f;
+    barrier(CLK_GLOBAL_MEM_FENCE);
+
+    // Calculate orientation histogram
+    for (int l = lid_y; l < len*len; l += lsz_y)
+    {
+        int i = l / len - radius;
+        int j = l % len - radius;
+
+        float x_rot = j * cos_t - i * sin_t;
+        float y_rot = j * sin_t + i * cos_t;
+        float ybin = y_rot + d/2 - 0.5f;
+        float xbin = x_rot + d/2 - 0.5f;
+
+        int y = pt_y + i;
+        if (y <= 0 || y >= rows - 1)
+            continue;
+
+        int x = pt_x + j;
+        if (x <= 0 || x >= cols - 1)
+            continue;
+
+        if( ybin > -1 && ybin < d && xbin > -1 && xbin < d &&
+            y > 0 && y < rows - 1 && x > 0 && x < cols - 1 )
+        {
+            float dx = (float)(IMG(y, x+1) - IMG(y, x-1));
+            float dy = (float)(IMG(y-1, x) - IMG(y+1, x));
+
+            float Ori = atan2(dy,dx) * 180.f / CV_PI;
+            if (Ori < 0.f)
+                Ori += 360.f;
+            float Mag = sqrt(dx*dx+dy*dy);
+            float W = exp((x_rot*x_rot + y_rot*y_rot)*exp_scale);
+
+            float obin = (Ori - ori)*bins_per_rad;
+            float mag = Mag*W;
+
+            int r0 = floor( ybin );
+            int c0 = floor( xbin );
+            int o0 = floor( obin );
+            ybin -= r0;
+            xbin -= c0;
+            obin -= o0;
+
+            if( o0 < 0 )
+                o0 += n;
+            if( o0 >= n )
+                o0 -= n;
+
+            // histogram update using tri-linear interpolation
+            float v_r1 = mag*ybin, v_r0 = mag - v_r1;
+            float v_rc11 = v_r1*xbin, v_rc10 = v_r1 - v_rc11;
+            float v_rc01 = v_r0*xbin, v_rc00 = v_r0 - v_rc01;
+            float v_rco111 = v_rc11*obin, v_rco110 = v_rc11 - v_rco111;
+            float v_rco101 = v_rc10*obin, v_rco100 = v_rc10 - v_rco101;
+            float v_rco011 = v_rc01*obin, v_rco010 = v_rc01 - v_rco011;
+            float v_rco001 = v_rc00*obin, v_rco000 = v_rc00 - v_rco001;
+
+            int idx = ((r0+1)*(d+2) + c0+1)*(n+2) + o0;
+            atomic_add_global_float(&HIST(hidx, idx), v_rco000);
+            atomic_add_global_float(&HIST(hidx, idx+1), v_rco001);
+            atomic_add_global_float(&HIST(hidx, idx+(n+2)), v_rco010);
+            atomic_add_global_float(&HIST(hidx, idx+(n+3)), v_rco011);
+            atomic_add_global_float(&HIST(hidx, idx+(d+2)*(n+2)), v_rco100);
+            atomic_add_global_float(&HIST(hidx, idx+(d+2)*(n+2)+1), v_rco101);
+            atomic_add_global_float(&HIST(hidx, idx+(d+3)*(n+2)), v_rco110);
+            atomic_add_global_float(&HIST(hidx, idx+(d+3)*(n+2)+1), v_rco111);
+        }
+    }
+    barrier(CLK_GLOBAL_MEM_FENCE);
+
+    // finalize histogram, since the orientation histograms are circular
+    for (int l = lid_y; l < d*d; l += lsz_y)
+    {
+        int i = l / d;
+        int j = l % d;
+
+        int idx = ((i+1)*(d+2) + (j+1))*(n+2);
+        atomic_add_global_float(&HIST(hidx, idx), HIST(hidx, idx+n));
+        atomic_add_global_float(&HIST(hidx, idx+1), HIST(hidx, idx+n+1));
+
+        for (int k = 0; k < n; k++)
+            DESC(kpidx, (i*d + j)*n + k) = HIST(hidx, idx+k);
+    }
+    barrier(CLK_GLOBAL_MEM_FENCE);
+
+    len = d*d*n;
+
+//    __local float nrm1;
+//    if(lid_y == 0)
+//        nrm1 = 300000;
+//    barrier(CLK_LOCAL_MEM_FENCE);
 //
-//    int i, j, k, len = (radius*2+1)*(radius*2+1), histlen = (d+2)*(d+2)*(n+2);
-//    int rows = img.rows, cols = img.cols;
-//
-//    AutoBuffer<float> buf(len*6 + histlen);
-//    float *X = buf, *Y = X + len, *Mag = Y, *Ori = Mag + len, *W = Ori + len;
-//    float *RBin = W + len, *CBin = RBin + len, *hist = CBin + len;
-//
-//    for( i = 0; i < d+2; i++ )
-//    {
-//        for( j = 0; j < d+2; j++ )
-//            for( k = 0; k < n+2; k++ )
-//                hist[(i*(d+2) + j)*(n+2) + k] = 0.;
-//    }
-//
-//    for( i = -radius, k = 0; i <= radius; i++ )
-//        for( j = -radius; j <= radius; j++ )
+//    for (int k = lid_y; k < len; k += lsz_y)
+//        atomic_add_local_float(&nrm1, DESC(kpidx, k)*DESC(kpidx, k));
+//    barrier(CLK_LOCAL_MEM_FENCE);
+
+    if (lid_y == 0)
+    {
+        float nrm2 = 0;
+        len = d*d*n;
+        for( int k = 0; k < len; k++ )
+            nrm2 += DESC(kpidx, k)*DESC(kpidx, k);
+
+//        float nrm2 = nrm1;
+        float thr = sqrt(nrm2)*SIFT_DESCR_MAG_THR;
+        nrm2 = 0;
+        for( int i = 0; i < len; i++ )
+        {
+            float val = min(DESC(kpidx, i), thr);
+            DESC(kpidx, i) = val;
+            nrm2 += val*val;
+        }
+        nrm2 = SIFT_INT_DESCR_FCTR/max(sqrt(nrm2), FLT_EPSILON);
+
+#if 1
+        for( int k = 0; k < len; k++ )
+        {
+            DESC(kpidx, k) = round(DESC(kpidx, k)*nrm2);
+        }
+#else
+//        float nrm1 = 0;
+//        for( k = 0; k < len; k++ )
 //        {
-//            // Calculate sample's histogram array coords rotated relative to ori.
-//            // Subtract 0.5 so samples that fall e.g. in the center of row 1 (i.e.
-//            // r_rot = 1.5) have full weight placed in row 1 after interpolation.
-//            float c_rot = j * cos_t - i * sin_t;
-//            float r_rot = j * sin_t + i * cos_t;
-//            float rbin = r_rot + d/2 - 0.5f;
-//            float cbin = c_rot + d/2 - 0.5f;
-//            int r = pt.y + i, c = pt.x + j;
-//
-//            if( rbin > -1 && rbin < d && cbin > -1 && cbin < d &&
-//                r > 0 && r < rows - 1 && c > 0 && c < cols - 1 )
-//            {
-//                float dx = (float)(img.at<sift_wt>(r, c+1) - img.at<sift_wt>(r, c-1));
-//                float dy = (float)(img.at<sift_wt>(r-1, c) - img.at<sift_wt>(r+1, c));
-//                X[k] = dx; Y[k] = dy; RBin[k] = rbin; CBin[k] = cbin;
-//                W[k] = (c_rot * c_rot + r_rot * r_rot)*exp_scale;
-//                k++;
-//            }
+//            dst[k] *= nrm2;
+//            nrm1 += dst[k];
 //        }
-//
-//    len = k;
-//    fastAtan2(Y, X, Ori, len, true);
-//    magnitude(X, Y, Mag, len);
-//    exp(W, W, len);
-//
-//    for( k = 0; k < len; k++ )
-//    {
-//        float rbin = RBin[k], cbin = CBin[k];
-//        float obin = (Ori[k] - ori)*bins_per_rad;
-//        float mag = Mag[k]*W[k];
-//
-//        int r0 = cvFloor( rbin );
-//        int c0 = cvFloor( cbin );
-//        int o0 = cvFloor( obin );
-//        rbin -= r0;
-//        cbin -= c0;
-//        obin -= o0;
-//
-//        if( o0 < 0 )
-//            o0 += n;
-//        if( o0 >= n )
-//            o0 -= n;
-//
-//        // histogram update using tri-linear interpolation
-//        float v_r1 = mag*rbin, v_r0 = mag - v_r1;
-//        float v_rc11 = v_r1*cbin, v_rc10 = v_r1 - v_rc11;
-//        float v_rc01 = v_r0*cbin, v_rc00 = v_r0 - v_rc01;
-//        float v_rco111 = v_rc11*obin, v_rco110 = v_rc11 - v_rco111;
-//        float v_rco101 = v_rc10*obin, v_rco100 = v_rc10 - v_rco101;
-//        float v_rco011 = v_rc01*obin, v_rco010 = v_rc01 - v_rco011;
-//        float v_rco001 = v_rc00*obin, v_rco000 = v_rc00 - v_rco001;
-//
-//        int idx = ((r0+1)*(d+2) + c0+1)*(n+2) + o0;
-//        hist[idx] += v_rco000;
-//        hist[idx+1] += v_rco001;
-//        hist[idx+(n+2)] += v_rco010;
-//        hist[idx+(n+3)] += v_rco011;
-//        hist[idx+(d+2)*(n+2)] += v_rco100;
-//        hist[idx+(d+2)*(n+2)+1] += v_rco101;
-//        hist[idx+(d+3)*(n+2)] += v_rco110;
-//        hist[idx+(d+3)*(n+2)+1] += v_rco111;
-//    }
-//
-//    // finalize histogram, since the orientation histograms are circular
-//    for( i = 0; i < d; i++ )
-//        for( j = 0; j < d; j++ )
+//        nrm1 = 1.f/std::max(nrm1, FLT_EPSILON);
+//        for( k = 0; k < len; k++ )
 //        {
-//            int idx = ((i+1)*(d+2) + (j+1))*(n+2);
-//            hist[idx] += hist[idx+n];
-//            hist[idx+1] += hist[idx+n+1];
-//            for( k = 0; k < n; k++ )
-//                dst[(i*d + j)*n + k] = hist[idx+k];
+//            dst[k] = std::sqrt(dst[k] * nrm1);//saturate_cast<uchar>(std::sqrt(dst[k] * nrm1)*SIFT_INT_DESCR_FCTR);
 //        }
-//    // copy histogram to the descriptor,
-//    // apply hysteresis thresholding
-//    // and scale the result, so that it can be easily converted
-//    // to byte array
-//    float nrm2 = 0;
-//    len = d*d*n;
-//    for( k = 0; k < len; k++ )
-//        nrm2 += dst[k]*dst[k];
-//    float thr = std::sqrt(nrm2)*SIFT_DESCR_MAG_THR;
-//    for( i = 0, nrm2 = 0; i < k; i++ )
-//    {
-//        float val = std::min(dst[i], thr);
-//        dst[i] = val;
-//        nrm2 += val*val;
-//    }
-//    nrm2 = SIFT_INT_DESCR_FCTR/std::max(std::sqrt(nrm2), FLT_EPSILON);
-//
-//#if 1
-//    for( k = 0; k < len; k++ )
-//    {
-//        dst[k] = saturate_cast<uchar>(dst[k]*nrm2);
-//    }
-//#else
-//    float nrm1 = 0;
-//    for( k = 0; k < len; k++ )
-//    {
-//        dst[k] *= nrm2;
-//        nrm1 += dst[k];
-//    }
-//    nrm1 = 1.f/std::max(nrm1, FLT_EPSILON);
-//    for( k = 0; k < len; k++ )
-//    {
-//        dst[k] = std::sqrt(dst[k] * nrm1);//saturate_cast<uchar>(std::sqrt(dst[k] * nrm1)*SIFT_INT_DESCR_FCTR);
-//    }
-//#endif
-//}
+#endif
+    }
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
 // calcOrientationHist

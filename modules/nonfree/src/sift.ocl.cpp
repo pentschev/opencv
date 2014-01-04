@@ -42,6 +42,68 @@
 //
 //M*/
 
+/**********************************************************************************************\
+ Implementation of SIFT is based on the code from http://blogs.oregonstate.edu/hess/code/sift/
+ Below is the original copyright.
+
+//    Copyright (c) 2006-2010, Rob Hess <hess@eecs.oregonstate.edu>
+//    All rights reserved.
+
+//    The following patent has been issued for methods embodied in this
+//    software: "Method and apparatus for identifying scale invariant features
+//    in an image and use of same for locating an object in an image," David
+//    G. Lowe, US Patent 6,711,293 (March 23, 2004). Provisional application
+//    filed March 8, 1999. Asignee: The University of British Columbia. For
+//    further details, contact David Lowe (lowe@cs.ubc.ca) or the
+//    University-Industry Liaison Office of the University of British
+//    Columbia.
+
+//    Note that restrictions imposed by this patent (and possibly others)
+//    exist independently of and may be in conflict with the freedoms granted
+//    in this license, which refers to copyright of the program, not patents
+//    for any methods that it implements.  Both copyright and patent law must
+//    be obeyed to legally use and redistribute this program and it is not the
+//    purpose of this license to induce you to infringe any patents or other
+//    property right claims or to contest validity of any such claims.  If you
+//    redistribute or use the program, then this license merely protects you
+//    from committing copyright infringement.  It does not protect you from
+//    committing patent infringement.  So, before you do anything with this
+//    program, make sure that you have permission to do so not merely in terms
+//    of copyright, but also in terms of patent law.
+
+//    Please note that this license is not to be understood as a guarantee
+//    either.  If you use the program according to this license, but in
+//    conflict with patent law, it does not mean that the licensor will refund
+//    you for any losses that you incur if you are sued for your patent
+//    infringement.
+
+//    Redistribution and use in source and binary forms, with or without
+//    modification, are permitted provided that the following conditions are
+//    met:
+//        * Redistributions of source code must retain the above copyright and
+//          patent notices, this list of conditions and the following
+//          disclaimer.
+//        * Redistributions in binary form must reproduce the above copyright
+//          notice, this list of conditions and the following disclaimer in
+//          the documentation and/or other materials provided with the
+//          distribution.
+//        * Neither the name of Oregon State University nor the names of its
+//          contributors may be used to endorse or promote products derived
+//          from this software without specific prior written permission.
+
+//    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
+//    IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+//    TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+//    PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+//    HOLDER BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+//    EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+//    PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+//    PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+//    LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+//    NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+//    SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+\**********************************************************************************************/
+
 #include "precomp.hpp"
 #include "opencl_kernels.hpp"
 
@@ -291,11 +353,11 @@ static void calcOrientationHist_OCL(const std::vector<oclMat>& gausspyr, const o
 
     openCLExecuteKernel(clCxt, &siftprog, kernelName, globalThreads, localThreads, args, -1, -1, buildOptions.c_str());
 
-    Mat b(keypointsOut);
-    std::cout << b.rows << " " << b.cols << std::endl;
-    std::cout << b.at<float>(0,0) << " " << b.at<float>(1,0) << " " << b.at<float>(2,0) << " " <<
-                 b.at<float>(3,0) << " " << b.at<float>(4,0) << " " << b.at<float>(5,0) << " " <<
-                 b.at<float>(6,0) << std::endl;
+//    Mat b(keypointsOut);
+//    std::cout << b.rows << " " << b.cols << std::endl;
+//    std::cout << b.at<float>(0,0) << " " << b.at<float>(1,0) << " " << b.at<float>(2,0) << " " <<
+//                 b.at<float>(3,0) << " " << b.at<float>(4,0) << " " << b.at<float>(5,0) << " " <<
+//                 b.at<float>(6,0) << std::endl;
 
     clEnqueueReadBuffer(*(cl_command_queue*)clCxt->getOpenCLCommandQueuePtr(),
                         counterCL, CL_TRUE, 0, sizeof(int), &counter, 0, NULL, NULL);
@@ -647,32 +709,173 @@ static void retainBest(oclMat& keypoints, const int nFeatures, const oclMat& key
     keypoints.cols = nFeatures;
 }
 
+static void calcDescriptors_OCL(const std::vector<oclMat>& gausspyr, const oclMat& keypoints,
+                                oclMat& descriptors, const int pyrOctave, const int nOctaveLayers,
+                                const int keypointOffset, const int totalKeypoints, const int d,
+                                const int n)
+{
+    CV_Assert(nOctaveLayers <= 3);
+
+    int octaveIdx = pyrOctave*(nOctaveLayers+3);
+
+    int cn = gausspyr[octaveIdx].channels();
+    int depth = gausspyr[octaveIdx].depth();
+    int rows = gausspyr[octaveIdx].rows;
+    int cols = gausspyr[octaveIdx].cols;
+
+    size_t localThreads[3] = {32, 8, 1};
+    size_t globalThreads[3] = {divUp(totalKeypoints, localThreads[0]) * localThreads[0],
+                               1,
+                               1};
+
+    const char * const channelMap[] = { "", "", "2", "4", "4" };
+    const char * const typeMap[] = { "uchar", "char", "ushort", "short", "int", "float", "double" };
+    String buildOptions = format("-D T=%s%s", typeMap[depth], channelMap[cn]);
+
+    Context *clCxt = Context::getContext();
+    String kernelName = "calcSIFTDescriptor";
+    std::vector< std::pair<size_t, const void *> > args;
+
+    int layerStep[3] = {0,0,0};
+    for (int i = 1; i <= nOctaveLayers; i++)
+        layerStep[i-1] = gausspyr[octaveIdx+i].step / gausspyr[octaveIdx+i].elemSize();
+
+    int keypointsStep = keypoints.step / keypoints.elemSize();
+    int descriptorsStep = descriptors.step / descriptors.elemSize();
+
+    oclMat hist;
+    ensureSizeIsEnough(totalKeypoints, (SIFT_DESCR_WIDTH+2)*(SIFT_DESCR_WIDTH+2)*(SIFT_DESCR_HIST_BINS+2), CV_32FC1, hist);
+    int histStep = hist.step / hist.elemSize();
+
+    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&gausspyr[octaveIdx+1].data));
+    if (nOctaveLayers >= 2)
+        args.push_back( std::make_pair( sizeof(cl_mem), (void *)&gausspyr[octaveIdx+2].data));
+    else
+        args.push_back( std::make_pair( sizeof(cl_mem), (void *)NULL));
+    if (nOctaveLayers == 3)
+        args.push_back( std::make_pair( sizeof(cl_mem), (void *)&gausspyr[octaveIdx+3].data));
+    else
+        args.push_back( std::make_pair( sizeof(cl_mem), (void *)NULL));
+    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&keypoints.data));
+    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&descriptors.data));
+    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&hist.data));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&nOctaveLayers));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&keypointOffset));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&totalKeypoints));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&rows));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&cols));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&layerStep[0]));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&layerStep[1]));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&layerStep[2]));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&keypointsStep));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&descriptorsStep));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&histStep));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&d));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&n));
+
+    openCLExecuteKernel(clCxt, &siftprog, kernelName, globalThreads, localThreads, args, -1, -1, buildOptions.c_str());
+}
+
+static void calcDescriptors(const std::vector<oclMat>& gpyr, const oclMat& keypoints, std::vector<int>& keypointsPerOctave,
+                            oclMat& descriptors, const int nOctaves, int nOctaveLayers, int firstOctave)
+{
+    int d = SIFT_DESCR_WIDTH, n = SIFT_DESCR_HIST_BINS;
+
+    std::cout << "Keypoints: " << keypoints.cols << std::endl;
+    std::cout << "Descriptors: " << descriptors.rows << std::endl;
+
+    for (int i = 0; i < nOctaves; i++)
+        std::cout << keypointsPerOctave[i] << std::endl;
+
+    if (firstOctave < 0)
+    {
+        int negKeypoints = 0;
+        std::cout << keypointsPerOctave.size() << std::endl;
+        for (int i = firstOctave; i < 0; i++)
+            negKeypoints = keypointsPerOctave[i-firstOctave];
+
+        int offset = 0;
+
+        // First pass, calculates descriptors for keypoints with positive octaves.
+        for (int o = 0; o < nOctaves+firstOctave; o++)
+        {
+            int numKp = keypointsPerOctave[o-firstOctave];
+            int pyrOctave = o-firstOctave;
+
+            std::cout << "pyrOctave: " << pyrOctave << std::endl;
+            std::cout << "numKp: " << numKp << std::endl;
+
+            calcDescriptors_OCL(gpyr, keypoints, descriptors, pyrOctave, nOctaveLayers, offset, numKp, d, n);
+            offset += numKp;
+            //offset += keypointsPerOctave[o-firstOctave];
+        }
+
+//        // Second pass, calculates descriptors for keypoints with negative octaves.
+//        // As negative octaves are stored as 2's complements, the ordered keypoints vector has
+//        // the negative octaves in the end, thus, they are calculated later.
+//        for (int o = 0; o < abs(firstOctave); o++)
+//        {
+//            int numKp = keypointsPerOctave[o];
+//            int pyrOctave = o;
+//
+////            std::cout << "offset: " << offset <<std::endl;
+//            std::cout << "pyrOctave: " << pyrOctave << std::endl;
+//            std::cout << "numKp: " << numKp << std::endl;
+//
+//            calcDescriptors_OCL(gpyr, keypoints, descriptors, pyrOctave, nOctaveLayers, offset, numKp, d, n);
+//            offset += numKp;
+//            //calcDescriptors_OCL();
+//            //offset += keypointsPerOctave[o];
+//        }
+    }
+    else
+    {
+
+    }
+
+//    for( size_t i = 0; i < keypoints.size(); i++ )
+//    {
+//        KeyPoint kpt = keypoints[i];
+//        int octave, layer;
+//        float scale;
+//        unpackOctave(kpt, octave, layer, scale);
+//        CV_Assert(octave >= firstOctave && layer <= nOctaveLayers+2);
+//        float size=kpt.size*scale;
+//        Point2f ptf(kpt.pt.x*scale, kpt.pt.y*scale);
+//        const Mat& img = gpyr[(octave - firstOctave)*(nOctaveLayers + 3) + layer];
+//
+//        float angle = 360.f - kpt.angle;
+//        if(std::abs(angle - 360.f) < FLT_EPSILON)
+//            angle = 0.f;
+//        calcSIFTDescriptor(img, ptf, angle, size*0.5f, d, n, descriptors.ptr<float>((int)i));
+//    }
+}
+
 //
 // Detects features at extrema in DoG scale space.  Bad features are discarded
 // based on contrast and ratio of principal curvatures.
 //void SIFT_OCL::findScaleSpaceExtrema(const std::vector<oclMat>& gauss_pyr, const std::vector<oclMat>& dog_pyr,
 //                                     std::vector<KeyPoint>& keypoints) const
 void SIFT_OCL::findScaleSpaceExtrema(const std::vector<oclMat>& gauss_pyr, const std::vector<oclMat>& dog_pyr,
-                                     const oclMat& mask, oclMat& keypoints, const int maxKeypoints,
-                                     const int firstOctave) const
+                                     const oclMat& mask, oclMat& keypoints, std::vector<int>& keypointsPerOctave,
+                                     const int maxKeypoints, const int firstOctave) const
 {
     int nOctaves = (int)gauss_pyr.size()/(nOctaveLayers + 3);
     int threshold = cvFloor(0.5 * contrastThreshold / nOctaveLayers * 255 * SIFT_FIXPT_SCALE);
     const int n = SIFT_ORI_HIST_BINS;
     float hist[n];
     int totalKeypoints = 0;
-//    KeyPoint kpt;
-//
-//    keypoints.clear();
+    //std::vector<int> keypointsPerOctave(nOctaves);
+    keypointsPerOctave.resize(nOctaves);
 
     for( int o = 0; o < nOctaves; o++ )
 //    for( int o = 0; o < 1; o++ )
     {
-        oclMat tmpKeypoints, tmpKeypoints2;
-        ensureSizeIsEnough(3,maxKeypoints,CV_32FC1,tmpKeypoints);
-        tmpKeypoints.setTo(Scalar::all(0));
-        ensureSizeIsEnough(3,maxKeypoints,CV_32FC1,tmpKeypoints2);
-        tmpKeypoints2.setTo(Scalar::all(0));
+        oclMat extremaKeypoints, adjustedKeypoints;
+        ensureSizeIsEnough(3,maxKeypoints,CV_32FC1,extremaKeypoints);
+        extremaKeypoints.setTo(Scalar::all(0));
+        ensureSizeIsEnough(3,maxKeypoints,CV_32FC1,adjustedKeypoints);
+        adjustedKeypoints.setTo(Scalar::all(0));
         int octaveKeypoints = 0;
 
         for( int i = 1; i <= nOctaveLayers; i++ )
@@ -685,22 +888,27 @@ void SIFT_OCL::findScaleSpaceExtrema(const std::vector<oclMat>& gauss_pyr, const
 //            int step = (int)img.step1();
 //            int rows = img.rows, cols = img.cols;
 
-            findExtrema_OCL(prev, img, next, tmpKeypoints, octaveKeypoints, o, i, maxKeypoints, threshold,
+            findExtrema_OCL(prev, img, next, extremaKeypoints, octaveKeypoints, o, i, maxKeypoints, threshold,
                             nOctaveLayers, static_cast<float>(contrastThreshold),
                             static_cast<float>(edgeThreshold), static_cast<float>(sigma));
         }
 
-        octaveKeypoints = std::min(octaveKeypoints, maxKeypoints);
-        std::cout << octaveKeypoints << std::endl;
+//        octaveKeypoints = std::min(octaveKeypoints, maxKeypoints);
+//        std::cout << octaveKeypoints << std::endl;
 
-        int octaveKeypointsInterpolated = 0;
+        int adjustedOctaveKeypoints = 0;
         if (octaveKeypoints > 0)
-            adjustLocalExtrema_OCL(dog_pyr, tmpKeypoints, tmpKeypoints2, octaveKeypoints, maxKeypoints,
-                                   octaveKeypointsInterpolated, o, nOctaveLayers, static_cast<float>(contrastThreshold),
+            adjustLocalExtrema_OCL(dog_pyr, extremaKeypoints, adjustedKeypoints, octaveKeypoints, maxKeypoints,
+                                   adjustedOctaveKeypoints, o, nOctaveLayers, static_cast<float>(contrastThreshold),
                                    static_cast<float>(edgeThreshold), static_cast<float>(sigma));
 
-        if (octaveKeypointsInterpolated > 0)
-            calcOrientationHist_OCL(gauss_pyr, tmpKeypoints2, keypoints, octaveKeypointsInterpolated, totalKeypoints, o, nOctaveLayers, firstOctave);
+        octaveKeypoints = totalKeypoints;
+        if (adjustedOctaveKeypoints > 0)
+            calcOrientationHist_OCL(gauss_pyr, adjustedKeypoints, keypoints, adjustedOctaveKeypoints, totalKeypoints, o, nOctaveLayers, firstOctave);
+
+        octaveKeypoints = totalKeypoints - octaveKeypoints;
+
+        keypointsPerOctave[o] = octaveKeypoints;
     }
 
     std::cout << totalKeypoints << std::endl;
@@ -791,7 +999,8 @@ void cv::ocl::SIFT_OCL::operator()(const oclMat& image, const oclMat& mask,
     //t = (double)getTickCount() - t;
     //printf("pyramid construction time: %g\n", t*1000./tf);
 
-    findScaleSpaceExtrema(gpyr, dogpyr, mask, keypoints, maxKeypoints, firstOctave);
+    std::vector<int> keypointsPerOctave;
+    findScaleSpaceExtrema(gpyr, dogpyr, mask, keypoints, keypointsPerOctave, maxKeypoints, firstOctave);
 
     const int key_elements = 6;
     int keys[key_elements] = {X_ROW, Y_ROW, SIZE_ROW, ANGLE_ROW, RESPONSE_ROW, OCTAVE_ROW};
@@ -799,7 +1008,7 @@ void cv::ocl::SIFT_OCL::operator()(const oclMat& image, const oclMat& mask,
 //    sortKeypoints_OCL(keypoints, keyOrder, false);
 
     oclMat tmpKeypoints;
-    removeDuplicated(keypoints, tmpKeypoints, keyOrder);
+//    removeDuplicated(keypoints, tmpKeypoints, keyOrder);
     std::cout << tmpKeypoints.cols << std::endl;
 
     if (nfeatures > 0)
@@ -810,8 +1019,37 @@ void cv::ocl::SIFT_OCL::operator()(const oclMat& image, const oclMat& mask,
         retainBest(tmpKeypoints, nfeatures, respOrder);
     }
 
-    tmpKeypoints.copyTo(keypoints);
-    std::cout << keypoints.cols << std::endl;
+//    tmpKeypoints.copyTo(keypoints);
+    std::cout << "Keypoints: " << keypoints.cols << std::endl;
+
+    // if( _descriptors.needed() )
+    // Reorder keypoints by octaves, enabling the descriptor calculator kernel to be run
+    // individually for each octave
+//    const int octv_elements = 1;
+//    int octv_keys[octv_elements] = {OCTAVE_ROW};
+//    oclMat octvOrder(1,octv_elements,CV_32SC1,octv_keys);
+//    sortKeypoints_OCL(keypoints, octvOrder, false);
+
+    const int octv_elements = 3;
+    int octv_keys[octv_elements] = {OCTAVE_ROW, X_ROW, Y_ROW};
+    oclMat octvOrder(1,octv_elements,CV_32SC1,octv_keys);
+    sortKeypoints_OCL(keypoints, octvOrder, false);
+
+    std::cout << "Keypoints: " << keypoints.cols << std::endl;
+
+    oclMat descriptors;
+    int dsize = descriptorSize();
+    ensureSizeIsEnough(keypoints.cols, dsize, CV_32FC1, descriptors);
+
+    calcDescriptors(gpyr, keypoints, keypointsPerOctave, descriptors, nOctaves, nOctaveLayers, firstOctave);
+    Mat desc;
+    desc = descriptors;
+    Mat kp = keypoints;
+    std::cout << kp.at<float>(X_ROW,10) << " " << kp.at<float>(Y_ROW,10) << std::endl;
+    std::cout << "[";
+    for (int i = 0; i < desc.cols; i++)
+        std::cout << desc.at<float>(10,i) << ", ";
+    std::cout << "]" << std::endl;
 
 //    Mat tmp;
 //    tmp = keypoints;
