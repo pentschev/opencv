@@ -651,7 +651,7 @@ static void removeDuplicated_OCL(const oclMat& keypointsIn, oclMat& keypointsOut
     int cn = keypointsIn.channels();
     int depth = keypointsIn.depth();
 
-    size_t localThreads[3] = {256, 1, 1};
+    size_t localThreads[3] = {1, 256, 1};
     size_t globalThreads[3] = {divUp(keypointsIn.cols, localThreads[0]) * localThreads[0],
                                1,
                                1};
@@ -723,7 +723,7 @@ static void calcDescriptors_OCL(const std::vector<oclMat>& gausspyr, const oclMa
     int rows = gausspyr[octaveIdx].rows;
     int cols = gausspyr[octaveIdx].cols;
 
-    size_t localThreads[3] = {32, 8, 1};
+    size_t localThreads[3] = {1, 256, 1};
     size_t globalThreads[3] = {divUp(totalKeypoints, localThreads[0]) * localThreads[0],
                                1,
                                1};
@@ -743,10 +743,6 @@ static void calcDescriptors_OCL(const std::vector<oclMat>& gausspyr, const oclMa
     int keypointsStep = keypoints.step / keypoints.elemSize();
     int descriptorsStep = descriptors.step / descriptors.elemSize();
 
-    oclMat hist;
-    ensureSizeIsEnough(totalKeypoints, (SIFT_DESCR_WIDTH+2)*(SIFT_DESCR_WIDTH+2)*(SIFT_DESCR_HIST_BINS+2), CV_32FC1, hist);
-    int histStep = hist.step / hist.elemSize();
-
     args.push_back( std::make_pair( sizeof(cl_mem), (void *)&gausspyr[octaveIdx+1].data));
     if (nOctaveLayers >= 2)
         args.push_back( std::make_pair( sizeof(cl_mem), (void *)&gausspyr[octaveIdx+2].data));
@@ -758,7 +754,6 @@ static void calcDescriptors_OCL(const std::vector<oclMat>& gausspyr, const oclMa
         args.push_back( std::make_pair( sizeof(cl_mem), (void *)NULL));
     args.push_back( std::make_pair( sizeof(cl_mem), (void *)&keypoints.data));
     args.push_back( std::make_pair( sizeof(cl_mem), (void *)&descriptors.data));
-    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&hist.data));
     args.push_back( std::make_pair( sizeof(cl_int), (void *)&nOctaveLayers));
     args.push_back( std::make_pair( sizeof(cl_int), (void *)&keypointOffset));
     args.push_back( std::make_pair( sizeof(cl_int), (void *)&totalKeypoints));
@@ -769,7 +764,6 @@ static void calcDescriptors_OCL(const std::vector<oclMat>& gausspyr, const oclMa
     args.push_back( std::make_pair( sizeof(cl_int), (void *)&layerStep[2]));
     args.push_back( std::make_pair( sizeof(cl_int), (void *)&keypointsStep));
     args.push_back( std::make_pair( sizeof(cl_int), (void *)&descriptorsStep));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&histStep));
     args.push_back( std::make_pair( sizeof(cl_int), (void *)&d));
     args.push_back( std::make_pair( sizeof(cl_int), (void *)&n));
 
@@ -796,6 +790,8 @@ static void calcDescriptors(const std::vector<oclMat>& gpyr, const oclMat& keypo
 
         int offset = 0;
 
+        clock_t time = clock();
+
         // First pass, calculates descriptors for keypoints with positive octaves.
         for (int o = 0; o < nOctaves+firstOctave; o++)
         {
@@ -810,23 +806,25 @@ static void calcDescriptors(const std::vector<oclMat>& gpyr, const oclMat& keypo
             //offset += keypointsPerOctave[o-firstOctave];
         }
 
-//        // Second pass, calculates descriptors for keypoints with negative octaves.
-//        // As negative octaves are stored as 2's complements, the ordered keypoints vector has
-//        // the negative octaves in the end, thus, they are calculated later.
-//        for (int o = 0; o < abs(firstOctave); o++)
-//        {
-//            int numKp = keypointsPerOctave[o];
-//            int pyrOctave = o;
-//
-////            std::cout << "offset: " << offset <<std::endl;
-//            std::cout << "pyrOctave: " << pyrOctave << std::endl;
-//            std::cout << "numKp: " << numKp << std::endl;
-//
-//            calcDescriptors_OCL(gpyr, keypoints, descriptors, pyrOctave, nOctaveLayers, offset, numKp, d, n);
-//            offset += numKp;
-//            //calcDescriptors_OCL();
-//            //offset += keypointsPerOctave[o];
-//        }
+        // Second pass, calculates descriptors for keypoints with negative octaves.
+        // As negative octaves are stored as 2's complements, the ordered keypoints vector has
+        // the negative octaves in the end, thus, they are calculated later.
+        for (int o = 0; o < abs(firstOctave); o++)
+        {
+            int numKp = keypointsPerOctave[o];
+            int pyrOctave = o;
+
+//            std::cout << "offset: " << offset <<std::endl;
+            std::cout << "pyrOctave: " << pyrOctave << std::endl;
+            std::cout << "numKp: " << numKp << std::endl;
+
+            calcDescriptors_OCL(gpyr, keypoints, descriptors, pyrOctave, nOctaveLayers, offset, numKp, d, n);
+            offset += numKp;
+            //calcDescriptors_OCL();
+            //offset += keypointsPerOctave[o];
+        }
+
+        std::cout << "calcDescriptors: " << (clock() - time) / (double)CLOCKS_PER_SEC << std::endl;
     }
     else
     {
@@ -868,6 +866,8 @@ void SIFT_OCL::findScaleSpaceExtrema(const std::vector<oclMat>& gauss_pyr, const
     //std::vector<int> keypointsPerOctave(nOctaves);
     keypointsPerOctave.resize(nOctaves);
 
+    clock_t extremaTime = 0, adjustTime = 0, oriTime = 0;
+
     for( int o = 0; o < nOctaves; o++ )
 //    for( int o = 0; o < 1; o++ )
     {
@@ -877,6 +877,8 @@ void SIFT_OCL::findScaleSpaceExtrema(const std::vector<oclMat>& gauss_pyr, const
         ensureSizeIsEnough(3,maxKeypoints,CV_32FC1,adjustedKeypoints);
         adjustedKeypoints.setTo(Scalar::all(0));
         int octaveKeypoints = 0;
+
+        clock_t time;
 
         for( int i = 1; i <= nOctaveLayers; i++ )
         {
@@ -888,28 +890,37 @@ void SIFT_OCL::findScaleSpaceExtrema(const std::vector<oclMat>& gauss_pyr, const
 //            int step = (int)img.step1();
 //            int rows = img.rows, cols = img.cols;
 
+            time = clock();
             findExtrema_OCL(prev, img, next, extremaKeypoints, octaveKeypoints, o, i, maxKeypoints, threshold,
                             nOctaveLayers, static_cast<float>(contrastThreshold),
                             static_cast<float>(edgeThreshold), static_cast<float>(sigma));
+            extremaTime += clock() - time;
         }
 
 //        octaveKeypoints = std::min(octaveKeypoints, maxKeypoints);
 //        std::cout << octaveKeypoints << std::endl;
 
+        time = clock();
         int adjustedOctaveKeypoints = 0;
         if (octaveKeypoints > 0)
             adjustLocalExtrema_OCL(dog_pyr, extremaKeypoints, adjustedKeypoints, octaveKeypoints, maxKeypoints,
                                    adjustedOctaveKeypoints, o, nOctaveLayers, static_cast<float>(contrastThreshold),
                                    static_cast<float>(edgeThreshold), static_cast<float>(sigma));
+        adjustTime += clock() - time;
 
         octaveKeypoints = totalKeypoints;
         if (adjustedOctaveKeypoints > 0)
             calcOrientationHist_OCL(gauss_pyr, adjustedKeypoints, keypoints, adjustedOctaveKeypoints, totalKeypoints, o, nOctaveLayers, firstOctave);
+        oriTime += clock() - time;
 
         octaveKeypoints = totalKeypoints - octaveKeypoints;
 
         keypointsPerOctave[o] = octaveKeypoints;
     }
+
+    std::cout << "extremaTime: " << extremaTime / (double)CLOCKS_PER_SEC << std::endl;
+    std::cout << "adjustTime: " << adjustTime / (double)CLOCKS_PER_SEC << std::endl;
+    std::cout << "oriTime: " << oriTime / (double)CLOCKS_PER_SEC << std::endl;
 
     std::cout << totalKeypoints << std::endl;
     //keypoints.cols = totalKeypoints;
@@ -993,8 +1004,10 @@ void cv::ocl::SIFT_OCL::operator()(const oclMat& image, const oclMat& mask,
 
     //double t, tf = getTickFrequency();
     //t = (double)getTickCount();
+    clock_t pyrTime = clock();
     buildGaussianPyramid(base, gpyr, nOctaves);
     buildDoGPyramid(gpyr, dogpyr);
+    std::cout << "pyrTime: " << pyrTime / (double)CLOCKS_PER_SEC << std::endl;
 
     //t = (double)getTickCount() - t;
     //printf("pyramid construction time: %g\n", t*1000./tf);
@@ -1045,11 +1058,17 @@ void cv::ocl::SIFT_OCL::operator()(const oclMat& image, const oclMat& mask,
     Mat desc;
     desc = descriptors;
     Mat kp = keypoints;
-    std::cout << kp.at<float>(X_ROW,10) << " " << kp.at<float>(Y_ROW,10) << std::endl;
+    std::cout << kp.at<float>(X_ROW,11) << " " << kp.at<float>(Y_ROW,11) << " " << kp.at<float>(ANGLE_ROW,11) << std::endl;
     std::cout << "[";
     for (int i = 0; i < desc.cols; i++)
-        std::cout << desc.at<float>(10,i) << ", ";
+        std::cout << desc.at<float>(11,i) << ", ";
     std::cout << "]" << std::endl;
+
+    // TODO: Check this
+//    for (int i = 0; i < desc.rows; i++)
+//        for (int j = 0; j < desc.cols; j++)
+//            if (desc.at<float>(i,j) > 200)
+//                std::cout << i << " " << desc.at<float>(i,j) << std::endl;
 
 //    Mat tmp;
 //    tmp = keypoints;

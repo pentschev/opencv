@@ -157,6 +157,43 @@ void reduce_16_fmax(__global float * data, int tid)
 }
 //#endif
 
+void reduce_16_sum(__local float * data, int tid)
+{
+#define op(A, B) sum(*A,B)
+//    data[tid] = *partial_reduction;
+//    barrier(CLK_GLOBAL_MEM_FENCE);
+#ifndef WAVE_SIZE
+#define WAVE_SIZE 1
+#endif
+    if (tid < 8)
+    {
+        data[tid] = fmax(data[tid], data[tid + 8]);
+#if WAVE_SIZE < 8
+    }
+    barrier(CLK_GLOBAL_MEM_FENCE);
+    if (tid < 4)
+    {
+#endif
+        data[tid] = fmax(data[tid], data[tid + 4]);
+#if WAVE_SIZE < 4
+    }
+    barrier(CLK_GLOBAL_MEM_FENCE);
+    if (tid < 2)
+    {
+#endif
+        data[tid] = fmax(data[tid], data[tid + 2]);
+#if WAVE_SIZE < 2
+    }
+    barrier(CLK_GLOBAL_MEM_FENCE);
+    if (tid < 1)
+    {
+#endif
+        data[tid] = fmax(data[tid], data[tid + 1]);
+    }
+#undef WAVE_SIZE
+#undef op
+}
+
 void reduce_36_fmax(__global float * data, int tid)
 {
 #define op(A, B) fmax(A,B)
@@ -291,7 +328,6 @@ void calcSIFTDescriptor(__global const T* layer1,
                         __global const T* layer3,
                         __global const float* keypoints,
                         __global float* descriptors,
-                        __global float* hist,
                         const int n_octave_layers,
                         const int keypoints_offset,
                         const int total_keypoints,
@@ -302,20 +338,21 @@ void calcSIFTDescriptor(__global const T* layer1,
                         const int layer3_step,
                         const int keypoints_step,
                         const int descriptors_step,
-                        const int hist_step,
-//                        float ori, float scl,
-                               int d, int n)
+                        const int d,
+                        const int n)
 {
     const int hidx =  mad24(get_group_id(0), get_local_size(0), get_local_id(0));
     const int kpidx = hidx + keypoints_offset;
     const int lid_y = get_local_id(1);
     const int lsz_y = get_local_size(1);
 
+    __local float lhist[360];
+    __local float desc[128];
+
     if (kpidx >= keypoints_offset+total_keypoints)
         return;
 
 #define KPT(Y,X) keypoints[mad24(Y,keypoints_step,X)]
-#define HIST(Y,X) hist[mad24(Y,hist_step,X)]
 #define IMG(Y,X) img[mad24(Y,img_step,X)]
 #define DESC(Y,X) descriptors[mad24(Y,descriptors_step,X)]
 
@@ -349,10 +386,8 @@ void calcSIFTDescriptor(__global const T* layer1,
         img_step = layer3_step;
     }
 
-//    float cos_t = cos(ori*(float)(CV_PI/180));
-//    float sin_t = sin(ori*(float)(CV_PI/180));
     float cos_t = cospi(ori/180.f);
-    float sin_t = sinpi(ori/180);
+    float sin_t = sinpi(ori/180.f);
     float bins_per_rad = n / 360.f;
     float exp_scale = -1.f/(d * d * 0.5f);
     float hist_width = SIFT_DESCR_SCL_FCTR * scl;
@@ -366,8 +401,8 @@ void calcSIFTDescriptor(__global const T* layer1,
     int len = (radius*2+1), histlen = (d+2)*(d+2)*(n+2);
 
     for (int i = lid_y; i < histlen; i += lsz_y)
-        HIST(hidx, i) = 0.f;
-    barrier(CLK_GLOBAL_MEM_FENCE);
+        lhist[i] = 0.f;
+    barrier(CLK_LOCAL_MEM_FENCE);
 
     // Calculate orientation histogram
     for (int l = lid_y; l < len*len; l += lsz_y)
@@ -425,17 +460,17 @@ void calcSIFTDescriptor(__global const T* layer1,
             float v_rco001 = v_rc00*obin, v_rco000 = v_rc00 - v_rco001;
 
             int idx = ((r0+1)*(d+2) + c0+1)*(n+2) + o0;
-            atomic_add_global_float(&HIST(hidx, idx), v_rco000);
-            atomic_add_global_float(&HIST(hidx, idx+1), v_rco001);
-            atomic_add_global_float(&HIST(hidx, idx+(n+2)), v_rco010);
-            atomic_add_global_float(&HIST(hidx, idx+(n+3)), v_rco011);
-            atomic_add_global_float(&HIST(hidx, idx+(d+2)*(n+2)), v_rco100);
-            atomic_add_global_float(&HIST(hidx, idx+(d+2)*(n+2)+1), v_rco101);
-            atomic_add_global_float(&HIST(hidx, idx+(d+3)*(n+2)), v_rco110);
-            atomic_add_global_float(&HIST(hidx, idx+(d+3)*(n+2)+1), v_rco111);
+            atomic_add_local_float(&lhist[idx], v_rco000);
+            atomic_add_local_float(&lhist[idx+1], v_rco001);
+            atomic_add_local_float(&lhist[idx+(n+2)], v_rco010);
+            atomic_add_local_float(&lhist[idx+(n+3)], v_rco011);
+            atomic_add_local_float(&lhist[idx+(d+2)*(n+2)], v_rco100);
+            atomic_add_local_float(&lhist[idx+(d+2)*(n+2)+1], v_rco101);
+            atomic_add_local_float(&lhist[idx+(d+3)*(n+2)], v_rco110);
+            atomic_add_local_float(&lhist[idx+(d+3)*(n+2)+1], v_rco111);
         }
     }
-    barrier(CLK_GLOBAL_MEM_FENCE);
+    barrier(CLK_LOCAL_MEM_FENCE);
 
     // finalize histogram, since the orientation histograms are circular
     for (int l = lid_y; l < d*d; l += lsz_y)
@@ -444,61 +479,36 @@ void calcSIFTDescriptor(__global const T* layer1,
         int j = l % d;
 
         int idx = ((i+1)*(d+2) + (j+1))*(n+2);
-        atomic_add_global_float(&HIST(hidx, idx), HIST(hidx, idx+n));
-        atomic_add_global_float(&HIST(hidx, idx+1), HIST(hidx, idx+n+1));
+        atomic_add_local_float(&lhist[idx], lhist[idx+n]);
+        atomic_add_local_float(&lhist[idx+1], lhist[idx+n+1]);
 
         for (int k = 0; k < n; k++)
-            DESC(kpidx, (i*d + j)*n + k) = HIST(hidx, idx+k);
+            desc[(i*d + j)*n + k] = lhist[idx+k];
+//            DESC(kpidx, (i*d + j)*n + k) = HIST(hidx, idx+k);
     }
-    barrier(CLK_GLOBAL_MEM_FENCE);
-
-    len = d*d*n;
-
-//    __local float nrm1;
-//    if(lid_y == 0)
-//        nrm1 = 300000;
-//    barrier(CLK_LOCAL_MEM_FENCE);
-//
-//    for (int k = lid_y; k < len; k += lsz_y)
-//        atomic_add_local_float(&nrm1, DESC(kpidx, k)*DESC(kpidx, k));
-//    barrier(CLK_LOCAL_MEM_FENCE);
+    barrier(CLK_LOCAL_MEM_FENCE);
 
     if (lid_y == 0)
     {
         float nrm2 = 0;
         len = d*d*n;
         for( int k = 0; k < len; k++ )
-            nrm2 += DESC(kpidx, k)*DESC(kpidx, k);
+            nrm2 += desc[k]*desc[k];
 
-//        float nrm2 = nrm1;
         float thr = sqrt(nrm2)*SIFT_DESCR_MAG_THR;
         nrm2 = 0;
         for( int i = 0; i < len; i++ )
         {
-            float val = min(DESC(kpidx, i), thr);
-            DESC(kpidx, i) = val;
+            float val = min(desc[i], thr);
+            desc[i] = val;
             nrm2 += val*val;
         }
         nrm2 = SIFT_INT_DESCR_FCTR/max(sqrt(nrm2), FLT_EPSILON);
 
-#if 1
         for( int k = 0; k < len; k++ )
         {
-            DESC(kpidx, k) = round(DESC(kpidx, k)*nrm2);
+            DESC(kpidx, k) = round(desc[k]*nrm2);
         }
-#else
-//        float nrm1 = 0;
-//        for( k = 0; k < len; k++ )
-//        {
-//            dst[k] *= nrm2;
-//            nrm1 += dst[k];
-//        }
-//        nrm1 = 1.f/std::max(nrm1, FLT_EPSILON);
-//        for( k = 0; k < len; k++ )
-//        {
-//            dst[k] = std::sqrt(dst[k] * nrm1);//saturate_cast<uchar>(std::sqrt(dst[k] * nrm1)*SIFT_INT_DESCR_FCTR);
-//        }
-#endif
     }
 }
 
@@ -871,7 +881,6 @@ void adjustLocalExtrema(__global const T* layer0,
             keypoints_out[KOIDX(X_ROW,res_idx)] = (c + xc) * (1 << octave);
             keypoints_out[KOIDX(Y_ROW,res_idx)] = (r + xr) * (1 << octave);
             keypoints_out[KOIDX(RESPONSE_ROW,res_idx)] = fabs(contr);
-//            keypoints_out[KOIDX(RESPONSE_ROW,res_idx)] = 1.1f;
             keypoints_out[KOIDX(OCTAVE_ROW,res_idx)] = octave;
             keypoints_out[KOIDX(LAYER_ROW,res_idx)] = layer;
             keypoints_out[KOIDX(SIZE_ROW,res_idx)] = sigma*pow(2.f, (layer + xi) / n_octave_layers)*(1 << octave)*2;
