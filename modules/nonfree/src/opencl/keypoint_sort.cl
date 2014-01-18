@@ -53,6 +53,7 @@
 #define CV_PI M_PI_F
 #endif
 
+// Ordering of keypoints, descending (!IS_GT) or ascending (IS_GT)
 #ifndef IS_GT
 #define IS_GT false
 #endif
@@ -63,8 +64,9 @@
 #define COMP_OP(x,y) ((x) < (y))
 #endif
 
+// Maximum ordering elements (limited to avoid local memory overflow)
 #ifndef MAX_ELEMENTS
-#define MAX_ELEMENTS 10
+#define MAX_ELEMENTS 8
 #endif
 
 #define MAX_VAL_ELEMENTS MAX_ELEMENTS
@@ -75,7 +77,6 @@
 #define KOIDX(Y,X) mad24(Y,keypoints_out_step,X)
 #define COMP(A,B) keypointLessThan(A, B, key_order, key_elements)
 #define COMP2(A,B) keypointLessThan2(keypoints, key_order, key_elements, A, B, keypoints_step)
-#define COMP3(A,B) keypointLessThan2(keypoints_in, key_order, key_elements, A, B, keypoints_in_step)
 
 static bool keypointLessThan(T* kp1,
                              T* kp2,
@@ -85,7 +86,6 @@ static bool keypointLessThan(T* kp1,
     for (int o = 0; o < elements; o++)
         if (kp1[o] != kp2[o])
             return COMP_OP(kp1[o], kp2[o]);
-            //return COMP_OP(kp1[o] < kp2[o];
 
     return false;
 }
@@ -100,7 +100,6 @@ static bool keypointLessThan2(__global T* keypoints,
     for (int o = 0; o < elements; o++)
         if (keypoints[KIDX(order[o], kp1_idx)] != keypoints[KIDX(order[o], kp2_idx)])
             return COMP_OP(keypoints[KIDX(order[o], kp1_idx)], keypoints[KIDX(order[o], kp2_idx)]);
-            //return keypoints[KIDX(order[o], kp1_idx)] < keypoints[KIDX(order[o], kp2_idx)];
 
     return false;
 }
@@ -235,18 +234,12 @@ void merge(__global T* keypoints_in,
     leftBlockIndex = min( leftBlockIndex, total_keypoints );
     uint rightBlockIndex = min( leftBlockIndex + srcLogicalBlockSize, total_keypoints );
 
-    // if( localID == 0 )
-    // {
-    // printf( "mergeTemplate: wavefront[ %i ] logicalBlock[ %i ] logicalIndex[ %i ] leftBlockIndex[ %i ] <=> rightBlockIndex[ %i ]\n", groupID, srcBlockNum, srcBlockIndex, leftBlockIndex, rightBlockIndex );
-    // }
-
     //  For a particular element in the input array, find the lowerbound index for it in the search sequence given by leftBlockIndex & rightBlockIndex
     // uint insertionIndex = lowerBoundLinear( iKey_ptr, leftBlockIndex, rightBlockIndex, iKey_ptr[ globalID ], my_comp ) - leftBlockIndex;
     uint insertionIndex = 0;
     if( (srcBlockNum & 0x1) == 0 )
     {
         uint lowerBound = lowerBoundBinary( keypoints_in, key_order, key_elements, leftBlockIndex, rightBlockIndex, globalID, keypoints_in_step );
-        //insertionIndex = lowerBoundBinary( iKey_ptr, leftBlockIndex, rightBlockIndex, iKey_ptr[ globalID ] ) - leftBlockIndex;
         insertionIndex = lowerBound - leftBlockIndex;
     }
     else
@@ -260,22 +253,9 @@ void merge(__global T* keypoints_in,
     uint dstBlockIndex = srcBlockIndex + insertionIndex;
     uint dstBlockNum = srcBlockNum/2;
 
-    // if( (dstBlockNum*dstLogicalBlockSize)+dstBlockIndex == 395 )
-    // {
-    // printf( "mergeTemplate: (dstBlockNum[ %i ] * dstLogicalBlockSize[ %i ]) + dstBlockIndex[ %i ] = srcBlockIndex[ %i ] + insertionIndex[ %i ]\n", dstBlockNum, dstLogicalBlockSize, dstBlockIndex, srcBlockIndex, insertionIndex );
-    // printf( "mergeTemplate: dstBlockIndex[ %i ] = iKey_ptr[ %i ] ( %i )\n", (dstBlockNum*dstLogicalBlockSize)+dstBlockIndex, globalID, iKey_ptr[ globalID ] );
-    // }
-//    oKey_ptr[ (dstBlockNum*dstLogicalBlockSize)+dstBlockIndex ] = iKey_ptr[ globalID ];
-//    oValue_ptr[ (dstBlockNum*dstLogicalBlockSize)+dstBlockIndex ] = iValue_ptr[ globalID ];
     uint dstIndex = (dstBlockNum*dstLogicalBlockSize)+dstBlockIndex;
     for (int i = 0; i < val_elements; i++)
-//        keypoints_out[i * keypoints_out_step + dstIndex] = globalID;
         keypoints_out[i * keypoints_out_step + dstIndex] = keypoints_in[i * keypoints_in_step + globalID];
-
-//    if (dstIndex == 260)
-//        for (int i = 0; i < val_elements; i++)
-//            keypoints_out[i * keypoints_out_step + dstIndex] = 0.f;
-    // printf( "mergeTemplate: leftResultIndex[ %i ]=%i + %i\n", leftResultIndex, srcBlockIndex, leftInsertionIndex );
 }
 
 
@@ -308,8 +288,6 @@ void blockInsertionSort(__global T* keypoints,
         T key[MAX_KEY_ELEMENTS];
         T val[MAX_VAL_ELEMENTS];
 
-        // printf( "Debug: endIndex[%i]=%i\n", groId, endIndex );
-
         //  Indices are signed because the while loop will generate a -1 index inside of the max function
         for( int currIndex = 1; currIndex < endIndex; ++currIndex )
         {
@@ -324,11 +302,7 @@ void blockInsertionSort(__global T* keypoints,
             for (int i = 0; i < key_elements; i++)
                 ldsKey[i] = keypoints[KIDX(key_order[i], GIDX(scanIndex - 1))];
 
-//            int idx1 = GIDX(currIndex);
-//            int idx2 = GIDX(scanIndex - 1);
-            while( scanIndex > 0 && COMP( key, ldsKey ) )
-//            while( scanIndex > 0 && COMP2( GIDX(currIndex), max(0, GIDX(scanIndex - 1)) ) )
-//            while( scanIndex > 0 && COMP2( idx1, idx2 ) )
+            while (scanIndex > 0 && COMP(key, ldsKey))
             {
                 T ldsVal[MAX_VAL_ELEMENTS];
                 for (int i = 0; i < val_elements; i++)
@@ -337,17 +311,14 @@ void blockInsertionSort(__global T* keypoints,
                 //  If the keys are being swapped, make sure the values are swapped identicaly
                 for (int i = 0; i < val_elements; i++)
                     keypoints[KIDX(i, GIDX(scanIndex))] = keypoints[KIDX(i, GIDX(scanIndex - 1))];
-//                    keypoints[KIDX(i, GIDX(scanIndex))] = ldsVal[i];
 
                 scanIndex = scanIndex - 1;
 
                 for (int i = 0; i < key_elements; i++)
                     ldsKey[i] = keypoints[KIDX(key_order[i], max(0, GIDX(scanIndex - 1)))];
-//                idx2 = max(0, GIDX(scanIndex - 1));
             }
             for (int i = 0; i < val_elements; i++)
                 keypoints[KIDX(i, GIDX(scanIndex))] = val[i];
-//                keypoints[KIDX(i, GIDX(scanIndex))] = keypoints[KIDX(i, GIDX(currIndex))];
         }
     }
 
@@ -355,17 +326,11 @@ void blockInsertionSort(__global T* keypoints,
 }
 
 __kernel
-void remove_duplicated(__global const T* keypoints_in,
-                       __global T* keypoints_out,
-                       __global int* counter,
-                       const int total_keypoints,
-                       const int keypoint_elements,
-//                       const int x_row,
-//                       const int y_row,
-//                       const int angle_row,
-//                       const int size_row,
-                       const int keypoints_in_step,
-                       const int keypoints_out_step)
+void remove_duplicated(__global const T* keypoints_in, const int keypoints_in_step,
+                       __global T* keypoints_out, const int keypoints_out_step,
+                       __global const int* order, const int order_elements,
+                       __global int* counter, const int total_keypoints,
+                       const int keypoint_elements)
 {
     const int lid_x = get_local_id(0);
     const int gid = get_global_id(0);
@@ -373,27 +338,17 @@ void remove_duplicated(__global const T* keypoints_in,
     if( gid >= total_keypoints )
         return;
 
-//    if( gid == 0 )
-//    {
-//        int idx = atomic_inc(counter);
-//
-//#pragma unroll
-//        for( int r = 0; r < keypoint_elements; r++)
-//            keypoints_out[KOIDX(r,idx)] = keypoints_in[KOIDX(r,0)];
-//    }
+    float fctr = 1000.f;
 
-//    if( keypoints_in[KIIDX(X_ROW, gid)] != keypoints_in[KIIDX(X_ROW, gid-1)] &&
-//        keypoints_in[KIIDX(Y_ROW, gid)] != keypoints_in[KIIDX(Y_ROW, gid-1)] &&
-//        keypoints_in[KIIDX(ANGLE_ROW, gid)] != keypoints_in[KIIDX(ANGLE_ROW, gid-1)] &&
-//        keypoints_in[KIIDX(SIZE_ROW, gid)] == keypoints_in[KIIDX(SIZE_ROW, gid-1)] )
-//    if( !(keypoints_in[KIIDX(0, gid)] == keypoints_in[KIIDX(0, gid-1)] &&
-//          keypoints_in[KIIDX(1, gid)] == keypoints_in[KIIDX(1, gid-1)] &&
-//          keypoints_in[KIIDX(4, gid)] == keypoints_in[KIIDX(4, gid-1)] &&
-//          keypoints_in[KIIDX(6, gid)] == keypoints_in[KIIDX(6, gid-1)]) )
-    if( round(keypoints_in[KIIDX(0, gid)]*1000.f) != round(keypoints_in[KIIDX(0, gid-1)]*1000.f) ||
-        round(keypoints_in[KIIDX(1, gid)]*1000.f) != round(keypoints_in[KIIDX(1, gid-1)]*1000.f) ||
-        round(keypoints_in[KIIDX(4, gid)]*1000.f) != round(keypoints_in[KIIDX(4, gid-1)]*1000.f) ||
-        round(keypoints_in[KIIDX(6, gid)]*1000.f) != round(keypoints_in[KIIDX(6, gid-1)]*1000.f) )
+    // Test if all order elements are equal
+    int equal_elements = 0;
+#pragma unroll
+    for (int i = 0; i < order_elements; i++)
+        if (round(keypoints_in[KIIDX(order[i], gid)]*fctr) == round(keypoints_in[KIIDX(order[i], gid-1)]*fctr))
+            equal_elements++;
+
+    // If at least one order element is not equal, store keypoint to output matrix
+    if (equal_elements != order_elements)
     {
         int idx = atomic_inc(counter);
 

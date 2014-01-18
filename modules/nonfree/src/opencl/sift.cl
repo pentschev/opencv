@@ -45,10 +45,6 @@
 // TODO
 //
 // 1) Vectorize implementation to reduce some clock cycles.
-// 2) Global memory has been used extensively due to the high amount of data, with careful evaluation
-// some parts of the algorithm might be implementable using local memory. One idea is to implement
-// the kernel in such a way that each work-group will process a small number of features at a time
-// (e.g., 1), but this has to be tested to evaluate if processing time results improve.
 
 
 #ifdef DOUBLE_SUPPORT
@@ -62,6 +58,7 @@
 #define CV_PI M_PI_F
 #endif
 
+// Define keypoint parameter rows
 #define X_ROW 0
 #define Y_ROW 1
 #define LAYER_ROW 2
@@ -100,150 +97,67 @@
 // factor used to convert floating-point descriptor to unsigned char
 #define SIFT_INT_DESCR_FCTR 512.f
 
-//#ifdef CPU
-//void reduce_32(volatile __local int* smem, volatile int* val, int tid)
-//{
-//#define op(A, B) (*A)+(B)
-//
-//    smem[tid] = *val;
-//    barrier(CLK_LOCAL_MEM_FENCE);
-//
-//    for(int i = 16; i > 0; i >>= 1)
-//    {
-//        if(tid < i)
-//        {
-//            smem[tid] = *val = op(val, smem[tid + i]);
-//        }
-//        barrier(CLK_LOCAL_MEM_FENCE);
-//    }
-//#undef op
-//}
-//#else
-void reduce_16_fmax(__global float * data, int tid)
+#ifdef CPU
+void reduce_36_fmax(volatile __local float * data, int tid)
 {
 #define op(A, B) fmax(*A,B)
-//    data[tid] = *partial_reduction;
-//    barrier(CLK_GLOBAL_MEM_FENCE);
+
+    for(int i = 32; i > 0; i >>= 1)
+    {
+        if(tid < i)
+        {
+            data[tid] = fmax(data[tid], smem[tid + i]);
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+#undef op
+}
+#else
+void reduce_36_fmax_local(__local float * data, int tid)
+{
 #ifndef WAVE_SIZE
 #define WAVE_SIZE 1
 #endif
+
+    if (tid < 16)
+    {
+        data[tid] = fmax(data[tid], data[tid + 16]);
+#if WAVE_SIZE < 16
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
     if (tid < 8)
     {
+#endif
         data[tid] = fmax(data[tid], data[tid + 8]);
 #if WAVE_SIZE < 8
     }
-    barrier(CLK_GLOBAL_MEM_FENCE);
+    barrier(CLK_LOCAL_MEM_FENCE);
     if (tid < 4)
     {
 #endif
         data[tid] = fmax(data[tid], data[tid + 4]);
 #if WAVE_SIZE < 4
     }
-    barrier(CLK_GLOBAL_MEM_FENCE);
+    barrier(CLK_LOCAL_MEM_FENCE);
     if (tid < 2)
     {
 #endif
         data[tid] = fmax(data[tid], data[tid + 2]);
+        data[tid+32] = fmax(data[tid+32], data[tid+32 + 2]);
 #if WAVE_SIZE < 2
     }
-    barrier(CLK_GLOBAL_MEM_FENCE);
+    barrier(CLK_LOCAL_MEM_FENCE);
     if (tid < 1)
     {
 #endif
         data[tid] = fmax(data[tid], data[tid + 1]);
+        data[tid+32] = fmax(data[tid+32], data[tid+32 + 1]);
+        data[tid] = fmax(data[tid], data[tid + 32]);
     }
 #undef WAVE_SIZE
-#undef op
 }
-//#endif
+#endif
 
-void reduce_16_sum(__local float * data, int tid)
-{
-#define op(A, B) sum(*A,B)
-//    data[tid] = *partial_reduction;
-//    barrier(CLK_GLOBAL_MEM_FENCE);
-#ifndef WAVE_SIZE
-#define WAVE_SIZE 1
-#endif
-    if (tid < 8)
-    {
-        data[tid] = fmax(data[tid], data[tid + 8]);
-#if WAVE_SIZE < 8
-    }
-    barrier(CLK_GLOBAL_MEM_FENCE);
-    if (tid < 4)
-    {
-#endif
-        data[tid] = fmax(data[tid], data[tid + 4]);
-#if WAVE_SIZE < 4
-    }
-    barrier(CLK_GLOBAL_MEM_FENCE);
-    if (tid < 2)
-    {
-#endif
-        data[tid] = fmax(data[tid], data[tid + 2]);
-#if WAVE_SIZE < 2
-    }
-    barrier(CLK_GLOBAL_MEM_FENCE);
-    if (tid < 1)
-    {
-#endif
-        data[tid] = fmax(data[tid], data[tid + 1]);
-    }
-#undef WAVE_SIZE
-#undef op
-}
-
-void reduce_36_fmax(__global float * data, int tid)
-{
-#define op(A, B) fmax(A,B)
-
-
-//    if (tid < 4)
-//    data[tid] = op(data[tid], data[tid + 32]);
-//
-//    barrier(CLK_GLOBAL_MEM_FENCE);
-
-#ifndef WAVE_SIZE
-#define WAVE_SIZE 1
-#endif
-    if (tid < 8)
-    {
-        data[tid*2] = op(data[tid*2], data[tid*2 + 16]);
-        data[tid*2+1] = op(data[tid*2+1], data[tid*2+1 + 16]);
-#if WAVE_SIZE < 8
-    }
-    barrier(CLK_GLOBAL_MEM_FENCE);
-    if (tid < 4)
-    {
-#endif
-        data[tid*2] = op(data[tid*2], data[tid*2 + 8]);
-        data[tid*2+1] = op(data[tid*2+1], data[tid*2+1 + 8]);
-#if WAVE_SIZE < 4
-    }
-    barrier(CLK_GLOBAL_MEM_FENCE);
-    if (tid < 2)
-    {
-#endif
-        data[tid*2] = op(data[tid*2], data[tid*2 + 4]);
-        data[tid*2+1] = op(data[tid*2+1], data[tid*2+1 + 4]);
-//        barrier(CLK_GLOBAL_MEM_FENCE);
-//        data[tid*2] = op(data[tid*2], data[tid*2 + 32]);
-//        data[tid*2+1] = op(data[tid*2+1], data[tid*2+1 + 32]);
-#if WAVE_SIZE < 2
-    }
-    barrier(CLK_GLOBAL_MEM_FENCE);
-    if (tid < 1)
-    {
-#endif
-        data[tid*2] = op(data[tid*2], data[tid*2 + 2]);
-        data[tid*2+1] = op(data[tid*2+1], data[tid*2+1 + 2]);
-        barrier(CLK_GLOBAL_MEM_FENCE);
-        data[tid] = op(data[tid], data[tid + 1]);
-    }
-#undef WAVE_SIZE
-#undef op
-}
 
 void atomic_add_local_float(volatile __local float *src, const float val) {
     union {
@@ -262,24 +176,7 @@ void atomic_add_local_float(volatile __local float *src, const float val) {
     } while (atomic_cmpxchg((volatile __local unsigned int *)src, prevVal.intVal, newVal.intVal) != prevVal.intVal);
 }
 
-
-void atomic_add_global_float(volatile __global float *src, const float val) {
-    union {
-        unsigned int intVal;
-        float floatVal;
-    } newVal;
-
-    union {
-        unsigned int intVal;
-        float floatVal;
-    } prevVal;
-
-    do {
-        prevVal.floatVal = *src;
-        newVal.floatVal = prevVal.floatVal + val;
-    } while (atomic_cmpxchg((volatile __global unsigned int *)src, prevVal.intVal, newVal.intVal) != prevVal.intVal);
-}
-
+// Gaussian elimination with pivoting to solve a 3-dimensional linear equation system
 static void gaussian_elimination_with_pivoting(float* A,
                                                float* b,
                                                float* X,
@@ -322,49 +219,45 @@ static void gaussian_elimination_with_pivoting(float* A,
 #undef AIDX
 }
 
+/////////////////////////////////////////// KERNELS ////////////////////////////////////////////////////
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////
+// calcSIFTDescriptor
+
 __kernel
-void calcSIFTDescriptor(__global const T* layer1,
-                        __global const T* layer2,
-                        __global const T* layer3,
-                        __global const float* keypoints,
-                        __global float* descriptors,
-                        const int n_octave_layers,
-                        const int keypoints_offset,
-                        const int total_keypoints,
-                        const int rows,
-                        const int cols,
-                        const int layer1_step,
-                        const int layer2_step,
-                        const int layer3_step,
-                        const int keypoints_step,
-                        const int descriptors_step,
-                        const int d,
-                        const int n)
+void calcSIFTDescriptor(__global const T* layer1, const int layer1_step,
+                        __global const T* layer2, const int layer2_step,
+                        __global const T* layer3, const int layer3_step,
+                        const int rows, const int cols,
+                        __global const float* keypoints, const int keypoints_step,
+                        __global float* descriptors, const int descriptors_step,
+                        const int n_octave_layers, const int keypoints_offset,
+                        const int total_keypoints, const int d,
+                        const int n, const float scale)
 {
     const int hidx =  mad24(get_group_id(0), get_local_size(0), get_local_id(0));
     const int kpidx = hidx + keypoints_offset;
     const int lid_y = get_local_id(1);
     const int lsz_y = get_local_size(1);
 
-    __local float lhist[360];
+    __local float hist[360];
     __local float desc[128];
 
     if (kpidx >= keypoints_offset+total_keypoints)
         return;
 
-#define KPT(Y,X) keypoints[mad24(Y,keypoints_step,X)]
+#define KP(Y,X) keypoints[mad24(Y,keypoints_step,X)]
 #define IMG(Y,X) img[mad24(Y,img_step,X)]
 #define DESC(Y,X) descriptors[mad24(Y,descriptors_step,X)]
 
-    const int pt_x = round(KPT(X_ROW, kpidx));
-    const int pt_y = round(KPT(Y_ROW, kpidx));
-    const int layer = round(KPT(LAYER_ROW, kpidx));
-    float angle = 360.f - KPT(ANGLE_ROW, kpidx);
+    const int layer = round(KP(LAYER_ROW, kpidx));
+    float angle = 360.f - KP(ANGLE_ROW, kpidx);
     if (fabs(angle - 360.f) < FLT_EPSILON)
         angle = 0.f;
     const float ori = angle;
-    const float size = KPT(SIZE_ROW, kpidx);
-    const float scl = size*0.5f;
+    const float size = KP(SIZE_ROW, kpidx);
+    const int pt_x = round(KP(X_ROW, kpidx) * scale);
+    const int pt_y = round(KP(Y_ROW, kpidx) * scale);
 
     // Points img to correct Gaussian pyramid layer
     __global const T* img;
@@ -390,7 +283,7 @@ void calcSIFTDescriptor(__global const T* layer1,
     float sin_t = sinpi(ori/180.f);
     float bins_per_rad = n / 360.f;
     float exp_scale = -1.f/(d * d * 0.5f);
-    float hist_width = SIFT_DESCR_SCL_FCTR * scl;
+    float hist_width = SIFT_DESCR_SCL_FCTR * size * scale * 0.5f;
     int radius = round(hist_width * 1.4142135623730951f * (d + 1) * 0.5f);
 
     // Clip the radius to the diagonal of the image to avoid autobuffer too large exception
@@ -401,7 +294,7 @@ void calcSIFTDescriptor(__global const T* layer1,
     int len = (radius*2+1), histlen = (d+2)*(d+2)*(n+2);
 
     for (int i = lid_y; i < histlen; i += lsz_y)
-        lhist[i] = 0.f;
+        hist[i] = 0.f;
     barrier(CLK_LOCAL_MEM_FENCE);
 
     // Calculate orientation histogram
@@ -416,12 +309,7 @@ void calcSIFTDescriptor(__global const T* layer1,
         float xbin = x_rot + d/2 - 0.5f;
 
         int y = pt_y + i;
-        if (y <= 0 || y >= rows - 1)
-            continue;
-
         int x = pt_x + j;
-        if (x <= 0 || x >= cols - 1)
-            continue;
 
         if( ybin > -1 && ybin < d && xbin > -1 && xbin < d &&
             y > 0 && y < rows - 1 && x > 0 && x < cols - 1 )
@@ -460,14 +348,14 @@ void calcSIFTDescriptor(__global const T* layer1,
             float v_rco001 = v_rc00*obin, v_rco000 = v_rc00 - v_rco001;
 
             int idx = ((r0+1)*(d+2) + c0+1)*(n+2) + o0;
-            atomic_add_local_float(&lhist[idx], v_rco000);
-            atomic_add_local_float(&lhist[idx+1], v_rco001);
-            atomic_add_local_float(&lhist[idx+(n+2)], v_rco010);
-            atomic_add_local_float(&lhist[idx+(n+3)], v_rco011);
-            atomic_add_local_float(&lhist[idx+(d+2)*(n+2)], v_rco100);
-            atomic_add_local_float(&lhist[idx+(d+2)*(n+2)+1], v_rco101);
-            atomic_add_local_float(&lhist[idx+(d+3)*(n+2)], v_rco110);
-            atomic_add_local_float(&lhist[idx+(d+3)*(n+2)+1], v_rco111);
+            atomic_add_local_float(&hist[idx], v_rco000);
+            atomic_add_local_float(&hist[idx+1], v_rco001);
+            atomic_add_local_float(&hist[idx+(n+2)], v_rco010);
+            atomic_add_local_float(&hist[idx+(n+3)], v_rco011);
+            atomic_add_local_float(&hist[idx+(d+2)*(n+2)], v_rco100);
+            atomic_add_local_float(&hist[idx+(d+2)*(n+2)+1], v_rco101);
+            atomic_add_local_float(&hist[idx+(d+3)*(n+2)], v_rco110);
+            atomic_add_local_float(&hist[idx+(d+3)*(n+2)+1], v_rco111);
         }
     }
     barrier(CLK_LOCAL_MEM_FENCE);
@@ -479,12 +367,11 @@ void calcSIFTDescriptor(__global const T* layer1,
         int j = l % d;
 
         int idx = ((i+1)*(d+2) + (j+1))*(n+2);
-        atomic_add_local_float(&lhist[idx], lhist[idx+n]);
-        atomic_add_local_float(&lhist[idx+1], lhist[idx+n+1]);
+        atomic_add_local_float(&hist[idx], hist[idx+n]);
+        atomic_add_local_float(&hist[idx+1], hist[idx+n+1]);
 
         for (int k = 0; k < n; k++)
-            desc[(i*d + j)*n + k] = lhist[idx+k];
-//            DESC(kpidx, (i*d + j)*n + k) = HIST(hidx, idx+k);
+            desc[(i*d + j)*n + k] = hist[idx+k];
     }
     barrier(CLK_LOCAL_MEM_FENCE);
 
@@ -506,10 +393,12 @@ void calcSIFTDescriptor(__global const T* layer1,
         nrm2 = SIFT_INT_DESCR_FCTR/max(sqrt(nrm2), FLT_EPSILON);
 
         for( int k = 0; k < len; k++ )
-        {
             DESC(kpidx, k) = round(desc[k]*nrm2);
-        }
     }
+
+#undef KP
+#undef IMG
+#undef DESC
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -517,25 +406,14 @@ void calcSIFTDescriptor(__global const T* layer1,
 
 // Computes a gradient orientation histogram at a specified pixel
 __kernel
-void calcOrientationHist(__global const T* layer1,
-                         __global const T* layer2,
-                         __global const T* layer3,
-                         __global float* keypoints_in,
-                         __global float* keypoints_out,
-                         __global float* hist,
-                         __global float* temphist,
-                         __global int* counter,
-                         const int num_keypoints,
-                         const int first_octave,
-                         const int img_rows,
-                         const int img_cols,
-                         const int layer1_step,
-                         const int layer2_step,
-                         const int layer3_step,
-                         const int keypoints_in_step,
-                         const int keypoints_out_step,
-                         const int hist_step,
-                         const int temphist_step)
+void calcOrientationHist(__global const T* layer1, const int layer1_step,
+                         __global const T* layer2, const int layer2_step,
+                         __global const T* layer3, const int layer3_step,
+                         const int img_rows, const int img_cols,
+                         __global float* keypoints_in, const int keypoints_in_step,
+                         __global float* keypoints_out, const int keypoints_out_step,
+                         __global int* counter, const int num_keypoints,
+                         const int first_octave)
 {
     const int kpidx = mad24(get_group_id(0), get_local_size(0), get_local_id(0));
     const int inst = mad24(get_group_id(1), get_local_size(1), get_local_id(1));
@@ -546,26 +424,35 @@ void calcOrientationHist(__global const T* layer1,
 
     const int n = SIFT_ORI_HIST_BINS;
 
-#define KIIDX(A,B) mad24(A,keypoints_in_step,B)
-#define KOIDX(A,B) mad24(A,keypoints_out_step,B)
-#define HIDX(A,B) mad24(A,hist_step,B)
-#define MIDX(A,B) mad24(A,mask_step,B)
-#define THIDX(A,B) mad24(A,temphist_step,B)
-#define IIDX(A,B) mad24(A,img_step,B)
+    const int hist_step = SIFT_ORI_HIST_BINS;
+    const int temphist_step = SIFT_ORI_HIST_BINS+4;
+    __local float hist[SIFT_ORI_HIST_BINS*4];
+    __local float temphist[(SIFT_ORI_HIST_BINS+4)*4];
+
+#define KPIN(A,B) keypoints_in[mad24(A,keypoints_in_step,B)]
+#define KPOUT(A,B) keypoints_out[mad24(A,keypoints_out_step,B)]
+#define HIST(A,B) hist[mad24(A,hist_step,B)]
+#define TEMPHIST(A,B) temphist[mad24(A,temphist_step,B)]
+#define IMG(A,B) img[mad24(A,img_step,B)]
 
     if (kpidx < num_keypoints)
     {
-        const float resp = keypoints_in[KIIDX(RESPONSE_ROW,kpidx)];
-        const int octave = keypoints_in[KIIDX(OCTAVE_ROW,kpidx)];
-        const int layer = keypoints_in[KIIDX(LAYER_ROW,kpidx)];
-        const float real_x = keypoints_in[KIIDX(X_ROW,kpidx)];
-        const float real_y = keypoints_in[KIIDX(Y_ROW,kpidx)];
-        const int pt_x = (int)round(keypoints_in[KIIDX(X_ROW,kpidx)] / (1 << octave));
-        const int pt_y = (int)round(keypoints_in[KIIDX(Y_ROW,kpidx)] / (1 << octave));
-        const float size = keypoints_in[KIIDX(SIZE_ROW,kpidx)];
+        // Load keypoint information
+        const float resp = KPIN(RESPONSE_ROW,kpidx);
+        const int octave = KPIN(OCTAVE_ROW,kpidx);
+        const int layer = KPIN(LAYER_ROW,kpidx);
+        const float real_x = KPIN(X_ROW,kpidx);
+        const float real_y = KPIN(Y_ROW,kpidx);
+        const int pt_x = (int)round(KPIN(X_ROW,kpidx) / (1 << octave));
+        const int pt_y = (int)round(KPIN(Y_ROW,kpidx) / (1 << octave));
+        const float size = KPIN(SIZE_ROW,kpidx);
+
+        // Calculate auxiliar parameters
         const float scl_octv = size*0.5f / (1 << octave);
         const int radius = (int)round(SIFT_ORI_RADIUS * scl_octv);
         const float sigma = SIFT_ORI_SIG_FCTR * scl_octv;
+        const int len = (radius*2+1);
+        const float expf_scale = -1.f/(2.f * sigma * sigma);
 
         // Points img to correct Gaussian pyramid layer
         __global const T* img;
@@ -587,8 +474,10 @@ void calcOrientationHist(__global const T* layer1,
             img_step = layer3_step;
         }
 
-        int len = (radius*2+1);
-        float expf_scale = -1.f/(2.f * sigma * sigma);
+        // Initialize temporary histogram
+        for (int i = lid_y; i < SIFT_ORI_HIST_BINS+4; i += lsz_y)
+            TEMPHIST(lid_x, i) = 0.f;
+        barrier(CLK_LOCAL_MEM_FENCE);
 
         // Calculate orientation histogram
         for (int l = lid_y; l < len*len; l += lsz_y)
@@ -597,15 +486,13 @@ void calcOrientationHist(__global const T* layer1,
             int j = l % len - radius;
 
             int y = pt_y + i;
-            if (y <= 0 || y >= img_rows - 1)
-                continue;
-
             int x = pt_x + j;
-            if (x <= 0 || x >= img_cols - 1)
+            if (y <= 0 || y >= img_rows - 1 ||
+                x <= 0 || x >= img_cols - 1)
                 continue;
 
-            float dx = (float)(img[IIDX(y,x+1)] - img[IIDX(y,x-1)]);
-            float dy = (float)(img[IIDX(y-1,x)] - img[IIDX(y+1,x)]);
+            float dx = (float)(IMG(y,x+1) - IMG(y,x-1));
+            float dy = (float)(IMG(y-1,x) - IMG(y+1,x));
 
             float Ori = atan2(dy,dx) * 180.f / CV_PI;
             float Mag = sqrt(dx*dx+dy*dy);
@@ -617,51 +504,43 @@ void calcOrientationHist(__global const T* layer1,
             if (bin < 0)
                 bin += n;
 
-            atomic_add_global_float(temphist+THIDX(kpidx, bin+2), W*Mag);
+            atomic_add_local_float(&TEMPHIST(lid_x, bin+2), W*Mag);
         }
+        barrier(CLK_LOCAL_MEM_FENCE);
 
         // Define histogram borders
         if (lid_y == 0)
         {
-            temphist[THIDX(kpidx, 0)] = temphist[THIDX(kpidx, n)];
-            temphist[THIDX(kpidx, 1)] = temphist[THIDX(kpidx, n+1)];
-            temphist[THIDX(kpidx, n+2)] = temphist[THIDX(kpidx, 2)];
-            temphist[THIDX(kpidx, n+3)] = temphist[THIDX(kpidx, 3)];
+            TEMPHIST(lid_x, 0) = TEMPHIST(lid_x, n);
+            TEMPHIST(lid_x, 1) = TEMPHIST(lid_x, n+1);
+            TEMPHIST(lid_x, n+2) = TEMPHIST(lid_x, 2);
+            TEMPHIST(lid_x, n+3) = TEMPHIST(lid_x, 3);
         }
-        barrier(CLK_GLOBAL_MEM_FENCE);
+        barrier(CLK_LOCAL_MEM_FENCE);
 
         // Smooth the histogram
         for (int i = 2+lid_y; i < n+2; i += lsz_y)
         {
-            hist[HIDX(kpidx, i-2)] = (temphist[THIDX(kpidx, i-2)] + temphist[THIDX(kpidx, i+2)])*(1.f/16.f) +
-                                     (temphist[THIDX(kpidx, i-1)] + temphist[THIDX(kpidx, i+1)])*(4.f/16.f) +
-                                      temphist[THIDX(kpidx, i)]*(6.f/16.f);
+            HIST(lid_x, i-2) = (TEMPHIST(lid_x, i-2) + TEMPHIST(lid_x, i+2))*(1.f/16.f) +
+                                                   (TEMPHIST(lid_x, i-1) + TEMPHIST(lid_x, i+1))*(4.f/16.f) +
+                                                   TEMPHIST(lid_x, i)*(6.f/16.f);
         }
-        barrier(CLK_GLOBAL_MEM_FENCE);
+        barrier(CLK_LOCAL_MEM_FENCE);
 
-        // Reduce 36-element histogram
-        // TODO: Reduce to a single operation
-        reduce_16_fmax(hist+HIDX(kpidx, 0), lid_y);
-        reduce_16_fmax(hist+HIDX(kpidx, 16), lid_y);
-//        reduce_36_fmax(hist+HIDX(kpidx, 0), lid_y);
-        barrier(CLK_GLOBAL_MEM_FENCE);
-        float maxval = fmax(hist[HIDX(kpidx, 0)],hist[HIDX(kpidx, 16)]);
-//        float maxval = hist[HIDX(kpidx, 0)];
-        maxval = fmax(maxval, hist[HIDX(kpidx, 32)]);
-        maxval = fmax(maxval, hist[HIDX(kpidx, 33)]);
-        maxval = fmax(maxval, hist[HIDX(kpidx, 34)]);
-        maxval = fmax(maxval, hist[HIDX(kpidx, 35)]);
+        // Find maximum histogram value by reducing the 36-element histogram
+        reduce_36_fmax_local(&HIST(lid_x, 0), lid_y);
+        barrier(CLK_LOCAL_MEM_FENCE);
+        float maxval = HIST(lid_x, 0);
         float mag_thr = (float)(maxval * SIFT_ORI_PEAK_RATIO);
-        barrier(CLK_GLOBAL_MEM_FENCE);
 
         // As reduction is a destructive operation, we have to copy the data back
         for (int i = 2+lid_y; i < n+2; i += lsz_y)
         {
-            hist[HIDX(kpidx, i-2)] = (temphist[THIDX(kpidx, i-2)] + temphist[THIDX(kpidx, i+2)])*(1.f/16.f) +
-                                     (temphist[THIDX(kpidx, i-1)] + temphist[THIDX(kpidx, i+1)])*(4.f/16.f) +
-                                      temphist[THIDX(kpidx, i)]*(6.f/16.f);
+            HIST(lid_x, i-2) = (TEMPHIST(lid_x, i-2) + TEMPHIST(lid_x, i+2))*(1.f/16.f) +
+                                                   (TEMPHIST(lid_x, i-1) + TEMPHIST(lid_x, i+1))*(4.f/16.f) +
+                                                   TEMPHIST(lid_x, i)*(6.f/16.f);
         }
-        barrier(CLK_GLOBAL_MEM_FENCE);
+        barrier(CLK_LOCAL_MEM_FENCE);
 
         // Tests for multiple orientations and store keypoint
         for (int j = lid_y; j < n; j += lsz_y)
@@ -669,14 +548,13 @@ void calcOrientationHist(__global const T* layer1,
             int l = j > 0 ? j - 1 : n - 1;
             int r2 = j < n-1 ? j + 1 : 0;
 
-            //if( hist[j] > hist[l]  &&  hist[j] > hist[r2]  &&  hist[j] >= mag_thr )
-            if (hist[HIDX(kpidx, j)] > hist[HIDX(kpidx, l)] &&
-                hist[HIDX(kpidx, j)] > hist[HIDX(kpidx, r2)] &&
-                hist[HIDX(kpidx, j)] >= mag_thr)
+            if (HIST(lid_x, j) > HIST(lid_x, l) &&
+                HIST(lid_x, j) > HIST(lid_x, r2) &&
+                HIST(lid_x, j) >= mag_thr)
             {
                 int finalIdx = atomic_inc(counter);
 
-                float bin = j + 0.5f * (hist[HIDX(kpidx, l)]-hist[HIDX(kpidx, r2)]) / (hist[HIDX(kpidx, l)] - 2*hist[HIDX(kpidx, j)] + hist[HIDX(kpidx, r2)]);
+                float bin = j + 0.5f * (HIST(lid_x, l)-HIST(lid_x, r2)) / (HIST(lid_x, l) - 2*HIST(lid_x, j) + HIST(lid_x, r2));
                 bin = bin < 0 ? n + bin : bin >= n ? bin - n : bin;
                 float angle = 360.f - (float)((360.f/n) * bin);
                 if(fabs(angle - 360.f) < FLT_EPSILON)
@@ -695,19 +573,22 @@ void calcOrientationHist(__global const T* layer1,
                     new_size = size*scale;
                 }
 
-//                keypoints_out[KOIDX(X_ROW, finalIdx)] = keypoints_in[KIIDX(X_ROW,kpidx)];
-//                keypoints_out[KOIDX(Y_ROW, finalIdx)] = keypoints_in[KIIDX(Y_ROW,kpidx)];
-                keypoints_out[KOIDX(X_ROW, finalIdx)] = new_real_x;
-                keypoints_out[KOIDX(Y_ROW, finalIdx)] = new_real_y;
-                keypoints_out[KOIDX(LAYER_ROW, finalIdx)] = layer;
-                //keypoints_out[KOIDX(RESPONSE_ROW, finalIdx)] = keypoints_in[KIIDX(RESPONSE_ROW, kpidx)];
-                keypoints_out[KOIDX(RESPONSE_ROW, finalIdx)] = resp;
-                keypoints_out[KOIDX(OCTAVE_ROW, finalIdx)] = new_octave;
-                keypoints_out[KOIDX(SIZE_ROW, finalIdx)] = new_size;
-                keypoints_out[KOIDX(ANGLE_ROW, finalIdx)] = angle;
+                KPOUT(X_ROW, finalIdx) = new_real_x;
+                KPOUT(Y_ROW, finalIdx) = new_real_y;
+                KPOUT(LAYER_ROW, finalIdx) = layer;
+                KPOUT(RESPONSE_ROW, finalIdx) = resp;
+                KPOUT(OCTAVE_ROW, finalIdx) = new_octave;
+                KPOUT(SIZE_ROW, finalIdx) = new_size;
+                KPOUT(ANGLE_ROW, finalIdx) = angle;
             }
         }
     }
+
+#undef KPIN
+#undef KPOUT
+#undef HIST
+#undef TEMPHIST
+#undef IMG
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -718,41 +599,29 @@ void calcOrientationHist(__global const T* layer1,
 // accuracy to form an image feature. Rejects features with low contrast.
 // Based on Section 4 of Lowe's paper.
 __kernel
-void adjustLocalExtrema(__global const T* layer0,
-                        __global const T* layer1,
-                        __global const T* layer2,
-                        __global const T* layer3,
-                        __global const T* layer4,
-                        __global const float* keypoints_in,
-                        __global float* keypoints_out,
-                        __global int* counter,
-                        const int octave_keypoints,
-                        const int max_keypoints,
-                        const int octave,
-                        const int n_octave_layers,
-                        const float contrast_threshold,
-                        const float edge_threshold,
-                        const float sigma,
-                        const int img_rows,
-                        const int img_cols,
-                        const int layer0_step,
-                        const int layer1_step,
-                        const int layer2_step,
-                        const int layer3_step,
-                        const int layer4_step,
-                        const int keypoints_in_step,
-                        const int keypoints_out_step)
+void adjustLocalExtrema(__global const T* layer0, const int layer0_step,
+                        __global const T* layer1, const int layer1_step,
+                        __global const T* layer2, const int layer2_step,
+                        __global const T* layer3, const int layer3_step,
+                        __global const T* layer4, const int layer4_step,
+                        const int img_rows, const int img_cols,
+                        __global const float* keypoints_in, const int keypoints_in_step,
+                        __global float* keypoints_out, const int keypoints_out_step,
+                        __global int* counter, const int octave_keypoints,
+                        const int max_keypoints, const int octave,
+                        const int n_octave_layers, const float contrast_threshold,
+                        const float edge_threshold, const float sigma)
 {
     const int idx = mad24(get_group_id(0), get_local_size(0), get_local_id(0));
 
     if (idx < octave_keypoints)
     {
 
-#define PIDX(A,B) mad24(A,prev_step,B)
-#define CIDX(A,B) mad24(A,center_step,B)
-#define NIDX(A,B) mad24(A,next_step,B)
-#define KIIDX(A,B) mad24(A,keypoints_in_step,B)
-#define KOIDX(A,B) mad24(A,keypoints_out_step,B)
+#define PREV(A,B) prev[mad24(A,prev_step,B)]
+#define CENTER(A,B) center[mad24(A,center_step,B)]
+#define NEXT(A,B) next[mad24(A,next_step,B)]
+#define KPIN(A,B) keypoints_in[mad24(A,keypoints_in_step,B)]
+#define KPOUT(A,B) keypoints_out[mad24(A,keypoints_out_step,B)]
 
         const float img_scale = 1.f/(255*SIFT_FIXPT_SCALE);
         const float deriv_scale = img_scale*0.5f;
@@ -762,15 +631,16 @@ void adjustLocalExtrema(__global const T* layer0,
         float xi=0, xr=0, xc=0, contr=0;
         int i = 0;
 
-        int c = keypoints_in[KIIDX(X_ROW,idx)];
-        int r = keypoints_in[KIIDX(Y_ROW,idx)];
-        int layer = keypoints_in[KIIDX(LAYER_ROW,idx)];
+        int c = KPIN(X_ROW,idx);
+        int r = KPIN(Y_ROW,idx);
+        int layer = KPIN(LAYER_ROW,idx);
 
         __global const T* prev;
         __global const T* center;
         __global const T* next;
         int prev_step, center_step, next_step;
 
+        // Iterative 3D keypoint interpolation
         for( ; i < SIFT_MAX_INTERP_STEPS; i++ )
         {
             if (layer == 1)
@@ -801,20 +671,20 @@ void adjustLocalExtrema(__global const T* layer0,
                 next_step = layer4_step;
             }
 
-            float dD[3] = {(center[CIDX(r, c+1)] - center[CIDX(r, c-1)]) * deriv_scale,
-                           (center[CIDX(r+1, c)] - center[CIDX(r-1, c)]) * deriv_scale,
-                           (next[NIDX(r, c)] - prev[PIDX(r, c)]) * deriv_scale};
+            float dD[3] = {(CENTER(r, c+1) - CENTER(r, c-1)) * deriv_scale,
+                           (CENTER(r+1, c) - CENTER(r-1, c)) * deriv_scale,
+                           (NEXT(r, c) - PREV(r, c)) * deriv_scale};
 
-            float v2 = (float)center[CIDX(r, c)]*2.f;
-            float dxx = (center[CIDX(r, c+1)] + center[CIDX(r, c-1)] - v2)*second_deriv_scale;
-            float dyy = (center[CIDX(r+1, c)] + center[CIDX(r-1, c)] - v2)*second_deriv_scale;
-            float dss = (next[NIDX(r, c)] + prev[PIDX(r, c)] - v2)*second_deriv_scale;
-            float dxy = (center[CIDX(r+1, c+1)] - center[CIDX(r+1, c-1)] -
-                         center[CIDX(r-1, c+1)] + center[CIDX(r-1, c-1)])*cross_deriv_scale;
-            float dxs = (next[NIDX(r, c+1)] - next[NIDX(r, c-1)] -
-                         prev[PIDX(r, c+1)] + prev[PIDX(r, c-1)])*cross_deriv_scale;
-            float dys = (next[NIDX(r+1, c)] - next[NIDX(r-1, c)] -
-                         prev[PIDX(r+1, c)] + prev[PIDX(r-1, c)])*cross_deriv_scale;
+            float v2 = (float)CENTER(r, c)*2.f;
+            float dxx = (CENTER(r, c+1) + CENTER(r, c-1) - v2)*second_deriv_scale;
+            float dyy = (CENTER(r+1, c) + CENTER(r-1, c) - v2)*second_deriv_scale;
+            float dss = (NEXT(r, c) + PREV(r, c) - v2)*second_deriv_scale;
+            float dxy = (CENTER(r+1, c+1) - CENTER(r+1, c-1) -
+                         CENTER(r-1, c+1) + CENTER(r-1, c-1))*cross_deriv_scale;
+            float dxs = (NEXT(r, c+1) - NEXT(r, c-1) -
+                         PREV(r, c+1) + PREV(r, c-1))*cross_deriv_scale;
+            float dys = (NEXT(r+1, c) - NEXT(r-1, c) -
+                         PREV(r+1, c) + PREV(r-1, c))*cross_deriv_scale;
 
             float H[9] = {dxx, dxy, dxs,
                           dxy, dyy, dys,
@@ -849,23 +719,23 @@ void adjustLocalExtrema(__global const T* layer0,
         if (i >= SIFT_MAX_INTERP_STEPS)
             return;
 
-        float4 dD = {(center[CIDX(r, c+1)] - center[CIDX(r, c-1)]) * deriv_scale,
-                     (center[CIDX(r+1, c)] - center[CIDX(r-1, c)]) * deriv_scale,
-                     (next[NIDX(r, c)] - prev[PIDX(r, c)]) * deriv_scale,
+        float4 dD = {(CENTER(r, c+1) - CENTER(r, c-1)) * deriv_scale,
+                     (CENTER(r+1, c) - CENTER(r-1, c)) * deriv_scale,
+                     (NEXT(r, c) - PREV(r, c)) * deriv_scale,
                      0};
         float4 X = {xc, xr, xi, 0};
         float t = dot(dD, X);
 
-        contr = center[CIDX(r, c)]*img_scale + t * 0.5f;
+        contr = CENTER(r, c)*img_scale + t * 0.5f;
         if(fabs(contr) * n_octave_layers < contrast_threshold)
             return;
 
         // principal curvatures are computed using the trace and det of Hessian
-        float v2 = center[CIDX(r, c)]*2.f;
-        float dxx = (center[CIDX(r, c+1)] + center[CIDX(r, c-1)] - v2)*second_deriv_scale;
-        float dyy = (center[CIDX(r+1, c)] + center[CIDX(r-1, c)] - v2)*second_deriv_scale;
-        float dxy = (center[CIDX(r+1, c+1)] - center[CIDX(r+1, c-1)] -
-                     center[CIDX(r-1, c+1)] + center[CIDX(r-1, c-1)]) * cross_deriv_scale;
+        float v2 = CENTER(r, c)*2.f;
+        float dxx = (CENTER(r, c+1) + CENTER(r, c-1) - v2)*second_deriv_scale;
+        float dyy = (CENTER(r+1, c) + CENTER(r-1, c) - v2)*second_deriv_scale;
+        float dxy = (CENTER(r+1, c+1) - CENTER(r+1, c-1) -
+                     CENTER(r-1, c+1) + CENTER(r-1, c-1)) * cross_deriv_scale;
 
         float tr = dxx + dyy;
         float det = dxx * dyy - dxy * dxy;
@@ -877,20 +747,19 @@ void adjustLocalExtrema(__global const T* layer0,
 
         if (res_idx < max_keypoints)
         {
-            //int tmp = octave + (layer << 8) + ((int)round((xi + 0.5f)*255) << 16);
-            keypoints_out[KOIDX(X_ROW,res_idx)] = (c + xc) * (1 << octave);
-            keypoints_out[KOIDX(Y_ROW,res_idx)] = (r + xr) * (1 << octave);
-            keypoints_out[KOIDX(RESPONSE_ROW,res_idx)] = fabs(contr);
-            keypoints_out[KOIDX(OCTAVE_ROW,res_idx)] = octave;
-            keypoints_out[KOIDX(LAYER_ROW,res_idx)] = layer;
-            keypoints_out[KOIDX(SIZE_ROW,res_idx)] = sigma*pow(2.f, (layer + xi) / n_octave_layers)*(1 << octave)*2;
+            KPOUT(X_ROW,res_idx) = (c + xc) * (1 << octave);
+            KPOUT(Y_ROW,res_idx) = (r + xr) * (1 << octave);
+            KPOUT(RESPONSE_ROW,res_idx) = fabs(contr);
+            KPOUT(OCTAVE_ROW,res_idx) = octave;
+            KPOUT(LAYER_ROW,res_idx) = layer;
+            KPOUT(SIZE_ROW,res_idx) = sigma*pow(2.f, (layer + xi) / n_octave_layers)*(1 << octave)*2;
         }
 
-#undef PIDX
-#undef CIDX
-#undef NIDX
-#undef KIIDX
-#undef KOIDX
+#undef PREV
+#undef CENTER
+#undef NEXT
+#undef KPIN
+#undef KPOUT
 
         return;
     }
@@ -900,27 +769,18 @@ void adjustLocalExtrema(__global const T* layer0,
 // findExtrema
 
 __kernel
-void findExtrema(__global const T* prev,
-                 __global const T* center,
-                 __global const T* next,
-                 __global float* keypoints,
-                 __global int* counter,
-                 const int octave,
-                 const int scale,
-                 const int max_keypoints,
-                 const int threshold,
-                 const int n_octave_layers,
-                 const float contrast_threshold,
-                 const float edge_threshold,
-                 const float sigma,
-                 const int img_rows,
-                 const int img_cols,
-                 const int prev_step,
-                 const int center_step,
-                 const int next_step,
-                 const int keypoints_step)
+void findExtrema(__global const T* prev, const int prev_step,
+                 __global const T* center, const int center_step,
+                 __global const T* next, const int next_step,
+                 const int img_rows, const int img_cols,
+                 __global float* keypoints, const int keypoints_step,
+                 __global int* counter, const int octave,
+                 const int scale, const int max_keypoints,
+                 const int threshold, const int n_octave_layers,
+                 const float contrast_threshold, const float edge_threshold,
+                 const float sigma)
 {
-    // One pixel border for all sides
+    // One pixel border for each side
     __local T next_mem[(8+2) * (32+2)];
     __local T center_mem[(8+2) * (32+2)];
     __local T prev_mem[(8+2) * (32+2)];
@@ -937,136 +797,124 @@ void findExtrema(__global const T* prev,
 
     const int mem_step = lsz_j + 2;
 
-#define IDX(A,B) mad24(A,mem_step,B)
-#define PIDX(A,B) mad24(A,prev_step,B)
-#define CIDX(A,B) mad24(A,center_step,B)
-#define NIDX(A,B) mad24(A,next_step,B)
-#define KIDX(A,B) mad24(A,keypoints_step,B)
+#define MPREV(A,B) prev_mem[mad24(A,mem_step,B)]
+#define MCENTER(A,B) center_mem[mad24(A,mem_step,B)]
+#define MNEXT(A,B) next_mem[mad24(A,mem_step,B)]
+#define PREV(A,B) prev[mad24(A,prev_step,B)]
+#define CENTER(A,B) center[mad24(A,center_step,B)]
+#define NEXT(A,B) next[mad24(A,next_step,B)]
+#define KP(A,B) keypoints[mad24(A,keypoints_step,B)]
 
     if (i < img_rows-SIFT_IMG_BORDER && j < img_cols-SIFT_IMG_BORDER)
     {
+        // Start by copying the parts of interest of each image to local memory
         // Copy central part
-        prev_mem[IDX(y, x)] = prev[PIDX(i, j)];
-        center_mem[IDX(y, x)] = center[CIDX(i, j)];
-        next_mem[IDX(y, x)] = next[NIDX(i, j)];
+        MPREV(y, x) = PREV(i, j);
+        MCENTER(y, x) = CENTER(i, j);
+        MNEXT(y, x) = NEXT(i, j);
 
         // Copy top border
         if (lid_i == 0)
         {
-            prev_mem[IDX(y-1, x)] = prev[PIDX(i-1, j)];
-            center_mem[IDX(y-1, x)] = center[CIDX(i-1, j)];
-            next_mem[IDX(y-1, x)] = next[NIDX(i-1, j)];
+            MPREV(y-1, x) = PREV(i-1, j);
+            MCENTER(y-1, x) = CENTER(i-1, j);
+            MNEXT(y-1, x) = NEXT(i-1, j);
 
             // Copy top left pixel
             if (lid_j == 0)
             {
-                prev_mem[IDX(y-1, x-1)] = prev[PIDX(i-1, j-1)];
-                center_mem[IDX(y-1, x-1)] = center[CIDX(i-1, j-1)];
-                next_mem[IDX(y-1, x-1)] = next[NIDX(i-1, j-1)];
+                MPREV(y-1, x-1) = PREV(i-1, j-1);
+                MCENTER(y-1, x-1) = CENTER(i-1, j-1);
+                MNEXT(y-1, x-1) = NEXT(i-1, j-1);
             }
             // Copy top right pixel
             else if (lid_j == lsz_j-1)
             {
-                prev_mem[IDX(y-1, x+1)] = prev[PIDX(i-1, j+1)];
-                center_mem[IDX(y-1, x+1)] = center[CIDX(i-1, j+1)];
-                next_mem[IDX(y-1, x+1)] = next[NIDX(i-1, j+1)];
+                MPREV(y-1, x+1) = PREV(i-1, j+1);
+                MCENTER(y-1, x+1) = CENTER(i-1, j+1);
+                MNEXT(y-1, x+1) = NEXT(i-1, j+1);
             }
         }
 
         // Copy left border
         if (lid_j == 0)
         {
-            prev_mem[IDX(y, x-1)] = prev[PIDX(i, j-1)];
-            center_mem[IDX(y, x-1)] = center[CIDX(i, j-1)];
-            next_mem[IDX(y, x-1)] = next[NIDX(i, j-1)];
+            MPREV(y, x-1) = PREV(i, j-1);
+            MCENTER(y, x-1) = CENTER(i, j-1);
+            MNEXT(y, x-1) = NEXT(i, j-1);
         }
 
         // Copy right border
         if (lid_j == lsz_j-1 || j == img_cols-SIFT_IMG_BORDER-1)
         {
-            prev_mem[IDX(y, x+1)] = prev[PIDX(i, j+1)];
-            center_mem[IDX(y, x+1)] = center[CIDX(i, j+1)];
-            next_mem[IDX(y, x+1)] = next[NIDX(i, j+1)];
+            MPREV(y, x+1) = PREV(i, j+1);
+            MCENTER(y, x+1) = CENTER(i, j+1);
+            MNEXT(y, x+1) = NEXT(i, j+1);
         }
 
         // Copy bottom border
         if (lid_i == lsz_i-1 || i == img_rows-SIFT_IMG_BORDER-1)
         {
-            prev_mem[IDX(y+1, x)] = prev[PIDX(i+1, j)];
-            center_mem[IDX(y+1, x)] = center[CIDX(i+1, j)];
-            next_mem[IDX(y+1, x)] = next[NIDX(i+1, j)];
+            MPREV(y+1, x) = PREV(i+1, j);
+            MCENTER(y+1, x) = CENTER(i+1, j);
+            MNEXT(y+1, x) = NEXT(i+1, j);
 
             if (lid_j == 0)
             {
-                prev_mem[IDX(y+1, x-1)] = prev[PIDX(i+1, j-1)];
-                center_mem[IDX(y+1, x-1)] = center[CIDX(i+1, j-1)];
-                next_mem[IDX(y+1, x-1)] = next[NIDX(i+1, j-1)];
+                MPREV(y+1, x-1) = PREV(i+1, j-1);
+                MCENTER(y+1, x-1) = CENTER(i+1, j-1);
+                MNEXT(y+1, x-1) = NEXT(i+1, j-1);
             }
             else if (lid_j == lsz_j-1 ||
                      (j == img_cols-SIFT_IMG_BORDER-1 && i == img_rows-SIFT_IMG_BORDER-1))
             {
-                prev_mem[IDX(y+1, x+1)] = prev[PIDX(i+1, j+1)];
-                center_mem[IDX(y+1, x+1)] = center[CIDX(i+1, j+1)];
-                next_mem[IDX(y+1, x+1)] = next[NIDX(i+1, j+1)];
+                MPREV(y+1, x+1) = PREV(i+1, j+1);
+                MCENTER(y+1, x+1) = CENTER(i+1, j+1);
+                MNEXT(y+1, x+1) = NEXT(i+1, j+1);
             }
         }
 
         barrier(CLK_LOCAL_MEM_FENCE);
 
-        T val = center_mem[IDX(y,x)];
+        T val = MCENTER(y,x);
 
+        // Perform extrema localization and store its location
         if (fabs((float)val) > threshold &&
-            ((val > 0 && val >= center_mem[IDX(y-1, x-1)] && val >= center_mem[IDX(y-1, x)] &&
-              val >= center_mem[IDX(y-1, x+1)] && val >= center_mem[IDX(y, x-1)] && val >= center_mem[IDX(y, x+1)] &&
-              val >= center_mem[IDX(y+1, x-1)] && val >= center_mem[IDX(y+1, x)] && val >= center_mem[IDX(y+1, x+1)] &&
-              val >= prev_mem[IDX(y-1, x-1)] && val >= prev_mem[IDX(y-1, x)] && val >= prev_mem[IDX(y-1, x+1)] &&
-              val >= prev_mem[IDX(y, x-1)] && val >= prev_mem[IDX(y, x)] && val >= prev_mem[IDX(y, x+1)] &&
-              val >= prev_mem[IDX(y+1, x-1)] && val >= prev_mem[IDX(y+1, x)] && val >= prev_mem[IDX(y+1, x+1)] &&
-              val >= next_mem[IDX(y-1, x-1)] && val >= next_mem[IDX(y-1, x)] && val >= next_mem[IDX(y-1, x+1)] &&
-              val >= next_mem[IDX(y, x-1)] && val >= next_mem[IDX(y, x)] && val >= next_mem[IDX(y, x+1)] &&
-              val >= next_mem[IDX(y+1, x-1)] && val >= next_mem[IDX(y+1, x)] && val >= next_mem[IDX(y+1, x+1)]) ||
-             (val < 0 && val <= center_mem[IDX(y-1, x-1)] && val <= center_mem[IDX(y-1, x)] &&
-              val <= center_mem[IDX(y-1, x+1)] && val <= center_mem[IDX(y, x-1)] && val <= center_mem[IDX(y, x+1)] &&
-              val <= center_mem[IDX(y+1, x-1)] && val <= center_mem[IDX(y+1, x)] && val <= center_mem[IDX(y+1, x+1)] &&
-              val <= prev_mem[IDX(y-1, x-1)] && val <= prev_mem[IDX(y-1, x)] && val <= prev_mem[IDX(y-1, x+1)] &&
-              val <= prev_mem[IDX(y, x-1)] && val <= prev_mem[IDX(y, x)] && val <= prev_mem[IDX(y, x+1)] &&
-              val <= prev_mem[IDX(y+1, x-1)] && val <= prev_mem[IDX(y+1, x)] && val <= prev_mem[IDX(y+1, x+1)] &&
-              val <= next_mem[IDX(y-1, x-1)] && val <= next_mem[IDX(y-1, x)] && val <= next_mem[IDX(y-1, x+1)] &&
-              val <= next_mem[IDX(y, x-1)] && val <= next_mem[IDX(y, x)] && val <= next_mem[IDX(y, x+1)] &&
-              val <= next_mem[IDX(y+1, x-1)] && val <= next_mem[IDX(y+1, x)] && val <= next_mem[IDX(y+1, x+1)])))
+            ((val > 0 && val >= MCENTER(y-1, x-1) && val >= MCENTER(y-1, x) &&
+              val >= MCENTER(y-1, x+1) && val >= MCENTER(y, x-1) && val >= MCENTER(y, x+1) &&
+              val >= MCENTER(y+1, x-1) && val >= MCENTER(y+1, x) && val >= MCENTER(y+1, x+1) &&
+              val >= MPREV(y-1, x-1) && val >= MPREV(y-1, x) && val >= MPREV(y-1, x+1) &&
+              val >= MPREV(y, x-1) && val >= MPREV(y, x) && val >= MPREV(y, x+1) &&
+              val >= MPREV(y+1, x-1) && val >= MPREV(y+1, x) && val >= MPREV(y+1, x+1) &&
+              val >= MNEXT(y-1, x-1) && val >= MNEXT(y-1, x) && val >= MNEXT(y-1, x+1) &&
+              val >= MNEXT(y, x-1) && val >= MNEXT(y, x) && val >= MNEXT(y, x+1) &&
+              val >= MNEXT(y+1, x-1) && val >= MNEXT(y+1, x) && val >= MNEXT(y+1, x+1)) ||
+             (val < 0 && val <= MCENTER(y-1, x-1) && val <= MCENTER(y-1, x) &&
+              val <= MCENTER(y-1, x+1) && val <= MCENTER(y, x-1) && val <= MCENTER(y, x+1) &&
+              val <= MCENTER(y+1, x-1) && val <= MCENTER(y+1, x) && val <= MCENTER(y+1, x+1) &&
+              val <= MPREV(y-1, x-1) && val <= MPREV(y-1, x) && val <= MPREV(y-1, x+1) &&
+              val <= MPREV(y, x-1) && val <= MPREV(y, x) && val <= MPREV(y, x+1) &&
+              val <= MPREV(y+1, x-1) && val <= MPREV(y+1, x) && val <= MPREV(y+1, x+1) &&
+              val <= MNEXT(y-1, x-1) && val <= MNEXT(y-1, x) && val <= MNEXT(y-1, x+1) &&
+              val <= MNEXT(y, x-1) && val <= MNEXT(y, x) && val <= MNEXT(y, x+1) &&
+              val <= MNEXT(y+1, x-1) && val <= MNEXT(y+1, x) && val <= MNEXT(y+1, x+1))))
         {
             int idx = atomic_inc(counter);
 
             if (idx < max_keypoints)
             {
-                keypoints[KIDX(X_ROW, idx)] = (float)j;
-                keypoints[KIDX(Y_ROW, idx)] = (float)i;
-                keypoints[KIDX(LAYER_ROW, idx)] = scale;
+                KP(X_ROW, idx) = (float)j;
+                KP(Y_ROW, idx) = (float)i;
+                KP(LAYER_ROW, idx) = scale;
             }
-            //int r1 = r, c1 = c, layer = i;
-            //int r_offset = i-y, c_offset = j-x;
-            //int r_mem = y, c_mem = x, layer = i;
-//            int r1 = i, c1 = j, layer = scale;
-//            if(!adjustLocalExtrema(prev, center, next, &layer, &r1, &c1,
-//                                   n_octave_layers, contrast_threshold, edge_threshold,
-//                                   sigma, img_rows, img_cols, prev_step, center_step, next_step))
-//                return;
-
-//            int r = r_offset + r_mem, c = c_offset + c_mem;
-//
-//            int idx = atomic_inc(counter);
-//
-//            if (idx < max_keypoints)
-//            {
-//                keypoints[KIDX(X_ROW, idx)] = c;
-//                keypoints[KIDX(Y_ROW, idx)] = r;
-//            }
         }
     }
 
-#undef IDX
-#undef PIDX
-#undef CIDX
-#undef NIDX
-#undef KIDX
+#undef MPREV
+#undef MCENTER
+#undef MNEXT
+#undef PREV
+#undef CENTER
+#undef NEXT
+#undef KP
 }

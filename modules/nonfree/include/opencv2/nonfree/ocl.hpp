@@ -82,9 +82,9 @@ namespace cv
 
             //! finds the keypoints using SIFT algorithm
             void operator()(const oclMat& img, const oclMat& mask,
-                            std::vector<KeyPoint>& keypoints);
+                            std::vector<KeyPoint>& keypoints, oclMat& descriptors);
             void operator()(const oclMat& img, const oclMat& mask,
-                            oclMat& keypoints);
+                            oclMat& keypoints, oclMat& descriptors);
 
             void buildGaussianPyramid(const oclMat& base, std::vector<oclMat>& pyr, int nOctaves) const;
             void buildDoGPyramid(const std::vector<oclMat>& pyr, std::vector<oclMat>& dogpyr) const;

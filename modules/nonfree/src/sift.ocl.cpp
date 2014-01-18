@@ -183,6 +183,7 @@ namespace
     #endif
 }
 
+//////////////////////////////////////// Static Methods ////////////////////////////////////////
 
 static oclMat createInitialImage(const oclMat& img, bool doubleImageSize, float sigma)
 {
@@ -210,6 +211,307 @@ static oclMat createInitialImage(const oclMat& img, bool doubleImageSize, float 
         return gray_fpt;
     }
 }
+
+
+/////////////////////////////// Static methods to call SIFT OpenCL kernels ///////////////////////////////
+
+static void calcOrientationHist_OCL(const std::vector<oclMat>& gausspyr, const oclMat& keypointsIn,
+                                    oclMat& keypointsOut, const int octaveKeypoints, int& counter,
+                                    const int octave, const int nOctaveLayers, const int firstOctave)
+{
+    CV_Assert(nOctaveLayers <= 3);
+
+    int octaveIdx = octave*(nOctaveLayers+3);
+
+    int cn = gausspyr[octaveIdx].channels();
+    int depth = gausspyr[octaveIdx].depth();
+    int rows = gausspyr[octaveIdx].rows;
+    int cols = gausspyr[octaveIdx].cols;
+
+//    size_t localThreads[3] = {1, 256, 1};
+//    size_t localThreads[3] = {16, 16, 1};
+    size_t localThreads[3] = {4, 64, 1};
+    size_t globalThreads[3] = {divUp(octaveKeypoints, localThreads[0]) * localThreads[0],
+//    size_t globalThreads[3] = {(octaveKeypoints / localThreads[0]) * localThreads[0],
+                               1,
+                               1};
+
+    const char * const channelMap[] = { "", "", "2", "4", "4" };
+    const char * const typeMap[] = { "uchar", "char", "ushort", "short", "int", "float", "double" };
+    String buildOptions = format("-D T=%s%s", typeMap[depth], channelMap[cn]);
+
+    Context *clCxt = Context::getContext();
+    String kernelName = "calcOrientationHist";
+    std::vector< std::pair<size_t, const void *> > args;
+
+    int layerStep[3] = {0,0,0};
+    for (int i = 1; i <= nOctaveLayers; i++)
+        layerStep[i-1] = gausspyr[octaveIdx+i].step / gausspyr[octaveIdx+i].elemSize();
+
+    int keypointsInStep = keypointsIn.step / keypointsIn.elemSize();
+    int keypointsOutStep = keypointsOut.step / keypointsOut.elemSize();
+
+    std::cout << "octaveKeypoints: " << octaveKeypoints << std::endl;
+
+    int err = CL_SUCCESS;
+    cl_mem counterCL = clCreateBuffer(*(cl_context*)clCxt->getOpenCLContextPtr(),
+                                    CL_MEM_COPY_HOST_PTR, sizeof(int),
+                                    &counter, &err);
+
+    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&gausspyr[octaveIdx+1].data));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&layerStep[0]));
+    if (nOctaveLayers >= 2)
+        args.push_back( std::make_pair( sizeof(cl_mem), (void *)&gausspyr[octaveIdx+2].data));
+    else
+        args.push_back( std::make_pair( sizeof(cl_mem), (void *)NULL));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&layerStep[1]));
+    if (nOctaveLayers == 3)
+        args.push_back( std::make_pair( sizeof(cl_mem), (void *)&gausspyr[octaveIdx+3].data));
+    else
+        args.push_back( std::make_pair( sizeof(cl_mem), (void *)NULL));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&layerStep[2]));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&rows));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&cols));
+    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&keypointsIn.data));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&keypointsInStep));
+    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&keypointsOut.data));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&keypointsOutStep));
+    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&counterCL));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&octaveKeypoints));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&firstOctave));
+
+    openCLExecuteKernel(clCxt, &siftprog, kernelName, globalThreads, localThreads, args, -1, -1, buildOptions.c_str());
+
+    clEnqueueReadBuffer(*(cl_command_queue*)clCxt->getOpenCLCommandQueuePtr(),
+                        counterCL, CL_TRUE, 0, sizeof(int), &counter, 0, NULL, NULL);
+    clReleaseMemObject(counterCL);
+    std::cout << "orientation counter: " << counter << std::endl;
+
+    keypointsOut.cols = counter;
+}
+
+
+static void adjustLocalExtrema_OCL(const std::vector<oclMat>& dogpyr, const oclMat& keypointsIn,
+                                   oclMat& keypointsOut, const int octaveKeypoints,
+                                   const int maxKeypoints, int& counter, const int octave,
+                                   const int nOctaveLayers, const float contrastThreshold,
+                                   const float edgeThreshold, const float sigma)
+{
+    CV_Assert(nOctaveLayers <= 3);
+
+    int octaveIdx = octave*(nOctaveLayers+2);
+
+    int cn = dogpyr[octaveIdx].channels();
+    int depth = dogpyr[octaveIdx].depth();
+    int rows = dogpyr[octaveIdx].rows;
+    int cols = dogpyr[octaveIdx].cols;
+
+    size_t localThreads[3] = {256, 1, 1};
+    size_t globalThreads[3] = {divUp(octaveKeypoints, localThreads[0]) * localThreads[0],
+                               1,
+                               1};
+
+    const char * const channelMap[] = { "", "", "2", "4", "4" };
+    const char * const typeMap[] = { "uchar", "char", "ushort", "short", "int", "float", "double" };
+    String buildOptions = format("-D T=%s%s", typeMap[depth], channelMap[cn]);
+
+    Context *clCxt = Context::getContext();
+    String kernelName = "adjustLocalExtrema";
+    std::vector< std::pair<size_t, const void *> > args;
+
+    int layerStep[5] = {0,0,0,0,0};
+    for (int i = 0; i < nOctaveLayers+2; i++)
+        layerStep[i] = dogpyr[octaveIdx+i].step / dogpyr[octaveIdx+i].elemSize();
+
+    int keypointsInStep = keypointsIn.step / keypointsIn.elemSize();
+    int keypointsOutStep = keypointsOut.step / keypointsOut.elemSize();
+    std::cout << "In: " << keypointsIn.cols << " " << keypointsIn.rows << " " << keypointsInStep << std::endl;
+    std::cout << "Out: " << keypointsOut.cols << " " << keypointsOut.rows << " " << keypointsOutStep << std::endl;
+
+    int err = CL_SUCCESS;
+    cl_mem counterCL = clCreateBuffer(*(cl_context*)clCxt->getOpenCLContextPtr(),
+                                    CL_MEM_COPY_HOST_PTR, sizeof(int),
+                                    &counter, &err);
+
+    std::cout << "counter1: " << counter << std::endl;
+
+    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&dogpyr[octaveIdx+0].data));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&layerStep[0]));
+    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&dogpyr[octaveIdx+1].data));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&layerStep[1]));
+    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&dogpyr[octaveIdx+2].data));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&layerStep[2]));
+    if (nOctaveLayers >= 2)
+        args.push_back( std::make_pair( sizeof(cl_mem), (void *)&dogpyr[octaveIdx+3].data));
+    else
+        args.push_back( std::make_pair( sizeof(cl_mem), (void *)NULL));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&layerStep[3]));
+    if (nOctaveLayers == 3)
+        args.push_back( std::make_pair( sizeof(cl_mem), (void *)&dogpyr[octaveIdx+4].data));
+    else
+        args.push_back( std::make_pair( sizeof(cl_mem), (void *)NULL));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&layerStep[4]));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&rows));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&cols));
+    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&keypointsIn.data));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&keypointsInStep));
+    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&keypointsOut.data));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&keypointsOutStep));
+    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&counterCL));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&octaveKeypoints));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&maxKeypoints));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&octave));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&nOctaveLayers));
+    args.push_back( std::make_pair( sizeof(cl_float), (void *)&contrastThreshold));
+    args.push_back( std::make_pair( sizeof(cl_float), (void *)&edgeThreshold));
+    args.push_back( std::make_pair( sizeof(cl_float), (void *)&sigma));
+
+    openCLExecuteKernel(clCxt, &siftprog, kernelName, globalThreads, localThreads, args, -1, -1, buildOptions.c_str());
+
+//    Mat b(keypointsOut);
+//    std::cout << b.rows << " " << b.cols << std::endl;
+//    std::cout << b.at<float>(0,0) << " " << b.at<float>(1,0) << " " << b.at<float>(2,0) << " " <<
+//                 b.at<float>(3,0) << " " << b.at<float>(4,0) << " " << b.at<float>(5,0) << " " <<
+//                 b.at<float>(6,0) << std::endl;
+
+    clEnqueueReadBuffer(*(cl_command_queue*)clCxt->getOpenCLCommandQueuePtr(),
+                        counterCL, CL_TRUE, 0, sizeof(int), &counter, 0, NULL, NULL);
+    clReleaseMemObject(counterCL);
+    std::cout << "adjust counter: " << counter << std::endl;
+}
+
+static void findExtrema_OCL(const oclMat& prev, const oclMat& center, const oclMat& next,
+                            oclMat& keypoints, int& counter, const int octave, const int scale,
+                            const int maxKeypoints, const int threshold, const int nOctaveLayers,
+                            const float contrastThreshold, const float edgeThreshold,
+                            const float sigma)
+{
+    CV_Assert(prev.rows == center.rows && center.rows == next.rows &&
+              prev.cols == center.cols && center.cols == next.cols &&
+              prev.depth() == center.depth() && center.depth() == next.depth() &&
+              prev.channels() == center.channels() && center.channels() == next.channels());
+
+    int cn = prev.channels();
+    int depth = prev.depth();
+
+    size_t localThreads[3] = {32, 8, 1};
+    size_t globalThreads[3] = {divUp(center.cols, localThreads[0]) * localThreads[0],
+                               divUp(center.rows, localThreads[1]) * localThreads[1],
+                               1};
+
+    const char * const channelMap[] = { "", "", "2", "4", "4" };
+    const char * const typeMap[] = { "uchar", "char", "ushort", "short", "int", "float", "double" };
+    String buildOptions = format("-D T=%s%s", typeMap[depth], channelMap[cn]);
+    //sprintf(optBufPtr, "-D WAVE_SIZE=%d", static_cast<int>(wave_size));
+
+    Context *clCxt = Context::getContext();
+    String kernelName = "findExtrema";
+    std::vector< std::pair<size_t, const void *> > args;
+
+    int prevStep = prev.step / prev.elemSize();
+    int centerStep = center.step / center.elemSize();
+    int nextStep = next.step / next.elemSize();
+    int keypointsStep = keypoints.step / keypoints.elemSize();
+
+    int err = CL_SUCCESS;
+    cl_mem counterCL = clCreateBuffer(*(cl_context*)clCxt->getOpenCLContextPtr(),
+                                      CL_MEM_COPY_HOST_PTR, sizeof(int),
+                                      &counter, &err);
+
+    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&prev.data));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&prevStep));
+    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&center.data));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&centerStep));
+    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&next.data));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&nextStep));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&center.rows));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&center.cols));
+    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&keypoints.data));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&keypointsStep));
+    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&counterCL));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&octave));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&scale));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&maxKeypoints));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&threshold));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&nOctaveLayers));
+    args.push_back( std::make_pair( sizeof(cl_float), (void *)&contrastThreshold));
+    args.push_back( std::make_pair( sizeof(cl_float), (void *)&edgeThreshold));
+    args.push_back( std::make_pair( sizeof(cl_float), (void *)&sigma));
+
+    openCLExecuteKernel(clCxt, &siftprog, kernelName, globalThreads, localThreads, args, -1, -1,
+                        buildOptions.c_str());
+
+/*    openCLSafeCall(clEnqueueReadBuffer(*(cl_command_queue*)clCxt->getOpenCLCommandQueuePtr(),
+                                       counterCL, CL_TRUE, 0, sizeof(int), &counter, 0, NULL, NULL));
+    openCLSafeCall(clReleaseMemObject(counterCL));*/
+    clEnqueueReadBuffer(*(cl_command_queue*)clCxt->getOpenCLCommandQueuePtr(),
+                        counterCL, CL_TRUE, 0, sizeof(int), &counter, 0, NULL, NULL);
+    clReleaseMemObject(counterCL);
+}
+
+static void calcDescriptors_OCL(const std::vector<oclMat>& gausspyr, const oclMat& keypoints,
+                                oclMat& descriptors, const int pyrOctave, const int nOctaveLayers,
+                                const float scale, const int keypointOffset, const int totalKeypoints,
+                                const int d, const int n)
+{
+    CV_Assert(nOctaveLayers <= 3);
+
+    int octaveIdx = pyrOctave*(nOctaveLayers+3);
+
+    int cn = gausspyr[octaveIdx].channels();
+    int depth = gausspyr[octaveIdx].depth();
+    int rows = gausspyr[octaveIdx].rows;
+    int cols = gausspyr[octaveIdx].cols;
+
+    size_t localThreads[3] = {1, 256, 1};
+    size_t globalThreads[3] = {divUp(totalKeypoints, localThreads[0]) * localThreads[0],
+                               1,
+                               1};
+
+    const char * const channelMap[] = { "", "", "2", "4", "4" };
+    const char * const typeMap[] = { "uchar", "char", "ushort", "short", "int", "float", "double" };
+    String buildOptions = format("-D T=%s%s", typeMap[depth], channelMap[cn]);
+
+    Context *clCxt = Context::getContext();
+    String kernelName = "calcSIFTDescriptor";
+    std::vector< std::pair<size_t, const void *> > args;
+
+    int layerStep[3] = {0,0,0};
+    for (int i = 1; i <= nOctaveLayers; i++)
+        layerStep[i-1] = gausspyr[octaveIdx+i].step / gausspyr[octaveIdx+i].elemSize();
+
+    int keypointsStep = keypoints.step / keypoints.elemSize();
+    int descriptorsStep = descriptors.step / descriptors.elemSize();
+
+    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&gausspyr[octaveIdx+1].data));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&layerStep[0]));
+    if (nOctaveLayers >= 2)
+        args.push_back( std::make_pair( sizeof(cl_mem), (void *)&gausspyr[octaveIdx+2].data));
+    else
+        args.push_back( std::make_pair( sizeof(cl_mem), (void *)NULL));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&layerStep[1]));
+    if (nOctaveLayers == 3)
+        args.push_back( std::make_pair( sizeof(cl_mem), (void *)&gausspyr[octaveIdx+3].data));
+    else
+        args.push_back( std::make_pair( sizeof(cl_mem), (void *)NULL));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&layerStep[2]));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&rows));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&cols));
+    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&keypoints.data));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&keypointsStep));
+    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&descriptors.data));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&descriptorsStep));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&nOctaveLayers));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&keypointOffset));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&totalKeypoints));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&d));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&n));
+    args.push_back( std::make_pair( sizeof(cl_float), (void *)&scale));
+
+    openCLExecuteKernel(clCxt, &siftprog, kernelName, globalThreads, localThreads, args, -1, -1,
+                        buildOptions.c_str());
+}
+
 
 void SIFT_OCL::buildGaussianPyramid(const oclMat& base, std::vector<oclMat>& pyr, int nOctaves) const
 {
@@ -265,260 +567,6 @@ void SIFT_OCL::buildDoGPyramid( const std::vector<oclMat>& gpyr, std::vector<ocl
             subtract(src2, src1, dst, oclMat());
         }
     }
-}
-
-static void calcOrientationHist_OCL(const std::vector<oclMat>& gausspyr, const oclMat& keypointsIn, oclMat& keypointsOut,
-                                    const int octaveKeypoints, int& counter, const int octave,
-                                    const int nOctaveLayers, const int firstOctave)
-{
-    CV_Assert(nOctaveLayers <= 3);
-
-    int octaveIdx = octave*(nOctaveLayers+3);
-
-    int cn = gausspyr[octaveIdx].channels();
-    int depth = gausspyr[octaveIdx].depth();
-    int rows = gausspyr[octaveIdx].rows;
-    int cols = gausspyr[octaveIdx].cols;
-
-    size_t localThreads[3] = {32, 8, 1};
-    size_t globalThreads[3] = {divUp(octaveKeypoints, localThreads[0]) * localThreads[0],
-//    size_t globalThreads[3] = {(octaveKeypoints / localThreads[0]) * localThreads[0],
-                               1,
-                               1};
-
-    const char * const channelMap[] = { "", "", "2", "4", "4" };
-    const char * const typeMap[] = { "uchar", "char", "ushort", "short", "int", "float", "double" };
-    String buildOptions = format("-D T=%s%s", typeMap[depth], channelMap[cn]);
-
-    Context *clCxt = Context::getContext();
-    String kernelName = "calcOrientationHist";
-    std::vector< std::pair<size_t, const void *> > args;
-
-    int layerStep[3] = {0,0,0};
-    for (int i = 1; i <= nOctaveLayers; i++)
-        layerStep[i-1] = gausspyr[octaveIdx+i].step / gausspyr[octaveIdx+i].elemSize();
-
-    int keypointsInStep = keypointsIn.step / keypointsIn.elemSize();
-    int keypointsOutStep = keypointsOut.step / keypointsOut.elemSize();
-
-    std::cout << "octaveKeypoints: " << octaveKeypoints << std::endl;
-
-    oclMat hist, tempHist;
-    ensureSizeIsEnough(octaveKeypoints, SIFT_ORI_HIST_BINS, CV_32FC1, hist);
-    ensureSizeIsEnough(octaveKeypoints, SIFT_ORI_HIST_BINS+4, CV_32FC1, tempHist);
-    tempHist.setTo(Scalar::all(0));
-//    hist.setTo(Scalar::all(0));
-
-    std::cout << tempHist.rows << " " << tempHist.cols << std::endl;
-
-    Mat a(keypointsIn);
-    std::cout << a.rows << " " << a.cols << std::endl;
-//        std::cout << a.at<float>(0,0) << " " << a.at<float>(1,0) << " " << a.at<float>(2,0) << " " <<
-//                     a.at<float>(3,0) << " " << a.at<float>(4,0) << " " << a.at<float>(5,0) << " " <<
-//                     a.at<float>(6,0) << std::endl;
-
-    int histStep = hist.step / hist.elemSize();
-    int tempHistStep = tempHist.step / tempHist.elemSize();
-
-    int err = CL_SUCCESS;
-    cl_mem counterCL = clCreateBuffer(*(cl_context*)clCxt->getOpenCLContextPtr(),
-                                    CL_MEM_COPY_HOST_PTR, sizeof(int),
-                                    &counter, &err);
-
-    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&gausspyr[octaveIdx+1].data));
-    if (nOctaveLayers >= 2)
-        args.push_back( std::make_pair( sizeof(cl_mem), (void *)&gausspyr[octaveIdx+2].data));
-    else
-        args.push_back( std::make_pair( sizeof(cl_mem), (void *)NULL));
-    if (nOctaveLayers == 3)
-        args.push_back( std::make_pair( sizeof(cl_mem), (void *)&gausspyr[octaveIdx+3].data));
-    else
-        args.push_back( std::make_pair( sizeof(cl_mem), (void *)NULL));
-    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&keypointsIn.data));
-    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&keypointsOut.data));
-    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&hist.data));
-    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&tempHist.data));
-    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&counterCL));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&octaveKeypoints));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&firstOctave));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&rows));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&cols));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&layerStep[0]));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&layerStep[1]));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&layerStep[2]));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&keypointsInStep));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&keypointsOutStep));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&histStep));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&tempHistStep));
-
-    openCLExecuteKernel(clCxt, &siftprog, kernelName, globalThreads, localThreads, args, -1, -1, buildOptions.c_str());
-
-//    Mat b(keypointsOut);
-//    std::cout << b.rows << " " << b.cols << std::endl;
-//    std::cout << b.at<float>(0,0) << " " << b.at<float>(1,0) << " " << b.at<float>(2,0) << " " <<
-//                 b.at<float>(3,0) << " " << b.at<float>(4,0) << " " << b.at<float>(5,0) << " " <<
-//                 b.at<float>(6,0) << std::endl;
-
-    clEnqueueReadBuffer(*(cl_command_queue*)clCxt->getOpenCLCommandQueuePtr(),
-                        counterCL, CL_TRUE, 0, sizeof(int), &counter, 0, NULL, NULL);
-    clReleaseMemObject(counterCL);
-    std::cout << "counter: " << counter << std::endl;
-
-    keypointsOut.cols = counter;
-}
-
-static void adjustLocalExtrema_OCL(const std::vector<oclMat>& dogpyr, const oclMat& keypointsIn,
-                                   oclMat& keypointsOut, const int octaveKeypoints,
-                                   const int maxKeypoints, int& counter, const int octave,
-                                   const int nOctaveLayers, const float contrastThreshold,
-                                   const float edgeThreshold, const float sigma)
-{
-    CV_Assert(nOctaveLayers <= 3);
-
-    int octaveIdx = octave*(nOctaveLayers+2);
-
-    int cn = dogpyr[octaveIdx].channels();
-    int depth = dogpyr[octaveIdx].depth();
-    int rows = dogpyr[octaveIdx].rows;
-    int cols = dogpyr[octaveIdx].cols;
-
-    size_t localThreads[3] = {256, 1, 1};
-    size_t globalThreads[3] = {divUp(octaveKeypoints, localThreads[0]) * localThreads[0],
-                               1,
-                               1};
-
-    const char * const channelMap[] = { "", "", "2", "4", "4" };
-    const char * const typeMap[] = { "uchar", "char", "ushort", "short", "int", "float", "double" };
-    String buildOptions = format("-D T=%s%s", typeMap[depth], channelMap[cn]);
-
-    Context *clCxt = Context::getContext();
-    String kernelName = "adjustLocalExtrema";
-    std::vector< std::pair<size_t, const void *> > args;
-
-    int layerStep[5] = {0,0,0,0,0};
-    for (int i = 0; i < nOctaveLayers+2; i++)
-        layerStep[i] = dogpyr[octaveIdx+i].step / dogpyr[octaveIdx+i].elemSize();
-
-    int keypointsInStep = keypointsIn.step / keypointsIn.elemSize();
-    int keypointsOutStep = keypointsOut.step / keypointsOut.elemSize();
-
-    int err = CL_SUCCESS;
-    cl_mem counterCL = clCreateBuffer(*(cl_context*)clCxt->getOpenCLContextPtr(),
-                                    CL_MEM_COPY_HOST_PTR, sizeof(int),
-                                    &counter, &err);
-
-    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&dogpyr[octaveIdx+0].data));
-    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&dogpyr[octaveIdx+1].data));
-    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&dogpyr[octaveIdx+2].data));
-    if (nOctaveLayers >= 2)
-        args.push_back( std::make_pair( sizeof(cl_mem), (void *)&dogpyr[octaveIdx+3].data));
-    else
-        args.push_back( std::make_pair( sizeof(cl_mem), (void *)NULL));
-    if (nOctaveLayers == 3)
-        args.push_back( std::make_pair( sizeof(cl_mem), (void *)&dogpyr[octaveIdx+4].data));
-    else
-        args.push_back( std::make_pair( sizeof(cl_mem), (void *)NULL));
-    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&keypointsIn.data));
-    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&keypointsOut.data));
-    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&counterCL));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&octaveKeypoints));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&maxKeypoints));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&octave));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&nOctaveLayers));
-    args.push_back( std::make_pair( sizeof(cl_float), (void *)&contrastThreshold));
-    args.push_back( std::make_pair( sizeof(cl_float), (void *)&edgeThreshold));
-    args.push_back( std::make_pair( sizeof(cl_float), (void *)&sigma));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&rows));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&cols));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&layerStep[0]));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&layerStep[1]));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&layerStep[2]));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&layerStep[3]));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&layerStep[4]));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&keypointsInStep));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&keypointsOutStep));
-
-    openCLExecuteKernel(clCxt, &siftprog, kernelName, globalThreads, localThreads, args, -1, -1, buildOptions.c_str());
-
-//    Mat b(keypointsOut);
-//    std::cout << b.rows << " " << b.cols << std::endl;
-//    std::cout << b.at<float>(0,0) << " " << b.at<float>(1,0) << " " << b.at<float>(2,0) << " " <<
-//                 b.at<float>(3,0) << " " << b.at<float>(4,0) << " " << b.at<float>(5,0) << " " <<
-//                 b.at<float>(6,0) << std::endl;
-
-    clEnqueueReadBuffer(*(cl_command_queue*)clCxt->getOpenCLCommandQueuePtr(),
-                        counterCL, CL_TRUE, 0, sizeof(int), &counter, 0, NULL, NULL);
-    clReleaseMemObject(counterCL);
-    std::cout << "counter: " << counter << std::endl;
-}
-
-static void findExtrema_OCL(const oclMat& prev, const oclMat& center, const oclMat& next,
-                            oclMat& keypoints, int& counter, const int octave, const int scale,
-                            const int maxKeypoints, const int threshold, const int nOctaveLayers,
-                            const float contrastThreshold, const float edgeThreshold,
-                            const float sigma)
-{
-    CV_Assert(prev.rows == center.rows && center.rows == next.rows &&
-              prev.cols == center.cols && center.cols == next.cols &&
-              prev.depth() == center.depth() && center.depth() == next.depth() &&
-              prev.channels() == center.channels() && center.channels() == next.channels());
-
-    int cn = prev.channels();
-    int depth = prev.depth();
-
-    size_t localThreads[3] = {32, 8, 1};
-    size_t globalThreads[3] = {divUp(center.cols, localThreads[0]) * localThreads[0],
-                               divUp(center.rows, localThreads[1]) * localThreads[1],
-                               1};
-
-    const char * const channelMap[] = { "", "", "2", "4", "4" };
-    const char * const typeMap[] = { "uchar", "char", "ushort", "short", "int", "float", "double" };
-    String buildOptions = format("-D T=%s%s", typeMap[depth], channelMap[cn]);
-    //sprintf(optBufPtr, "-D WAVE_SIZE=%d", static_cast<int>(wave_size));
-
-    Context *clCxt = Context::getContext();
-    String kernelName = "findExtrema";
-    std::vector< std::pair<size_t, const void *> > args;
-
-    int prevStep = prev.step / prev.elemSize();
-    int centerStep = center.step / center.elemSize();
-    int nextStep = next.step / next.elemSize();
-    int keypointsStep = keypoints.step / keypoints.elemSize();
-
-    int err = CL_SUCCESS;
-    cl_mem counterCL = clCreateBuffer(*(cl_context*)clCxt->getOpenCLContextPtr(),
-                                    CL_MEM_COPY_HOST_PTR, sizeof(int),
-                                    &counter, &err);
-
-    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&prev.data));
-    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&center.data));
-    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&next.data));
-    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&keypoints.data));
-    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&counterCL));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&octave));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&scale));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&maxKeypoints));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&threshold));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&nOctaveLayers));
-    args.push_back( std::make_pair( sizeof(cl_float), (void *)&contrastThreshold));
-    args.push_back( std::make_pair( sizeof(cl_float), (void *)&edgeThreshold));
-    args.push_back( std::make_pair( sizeof(cl_float), (void *)&sigma));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&center.rows));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&center.cols));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&prevStep));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&centerStep));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&nextStep));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&keypointsStep));
-
-
-    openCLExecuteKernel(clCxt, &siftprog, kernelName, globalThreads, localThreads, args, -1, -1, buildOptions.c_str());
-
-/*    openCLSafeCall(clEnqueueReadBuffer(*(cl_command_queue*)clCxt->getOpenCLCommandQueuePtr(),
-                                       counterCL, CL_TRUE, 0, sizeof(int), &counter, 0, NULL, NULL));
-    openCLSafeCall(clReleaseMemObject(counterCL));*/
-    clEnqueueReadBuffer(*(cl_command_queue*)clCxt->getOpenCLCommandQueuePtr(),
-                        counterCL, CL_TRUE, 0, sizeof(int), &counter, 0, NULL, NULL);
-    clReleaseMemObject(counterCL);
 }
 
 namespace
@@ -644,14 +692,14 @@ static void sortKeypoints_OCL(oclMat& keypoints, const oclMat& keyOrder, bool is
     std::cout << "TIME: " << (clock() - time) / (double)CLOCKS_PER_SEC << std::endl;
 }
 
-static void removeDuplicated_OCL(const oclMat& keypointsIn, oclMat& keypointsOut, const oclMat& keyOrder)
+static void removeDuplicated_OCL(const oclMat& keypointsIn, oclMat& keypointsOut, const oclMat& duplicateOrder)
 {
     CV_Assert(keypointsIn.cols > 0);
 
     int cn = keypointsIn.channels();
     int depth = keypointsIn.depth();
 
-    size_t localThreads[3] = {1, 256, 1};
+    size_t localThreads[3] = {256, 1, 1};
     size_t globalThreads[3] = {divUp(keypointsIn.cols, localThreads[0]) * localThreads[0],
                                1,
                                1};
@@ -676,12 +724,14 @@ static void removeDuplicated_OCL(const oclMat& keypointsIn, oclMat& keypointsOut
                                     &counter, &err);
 
     args.push_back( std::make_pair( sizeof(cl_mem), (void *)&keypointsIn.data));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&keypointsInStep));
     args.push_back( std::make_pair( sizeof(cl_mem), (void *)&keypointsOut.data));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&keypointsOutStep));
+    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&duplicateOrder.data));
+    args.push_back( std::make_pair( sizeof(cl_int), (void *)&duplicateOrder.cols));
     args.push_back( std::make_pair( sizeof(cl_mem), (void *)&counterCL));
     args.push_back( std::make_pair( sizeof(cl_int), (void *)&keypointsIn.cols));
     args.push_back( std::make_pair( sizeof(cl_int), (void *)&keypointsIn.rows));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&keypointsInStep));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&keypointsOutStep));
 
     openCLExecuteKernel(clCxt, &keypoint_sort_prog, kernelName, globalThreads, localThreads, args,
                         -1, -1, buildOptions.c_str());
@@ -693,12 +743,13 @@ static void removeDuplicated_OCL(const oclMat& keypointsIn, oclMat& keypointsOut
     keypointsOut.cols = counter;
 }
 
-static void removeDuplicated(oclMat& keypointsIn, oclMat& keypointsOut, const oclMat& keyOrder)
+static void removeDuplicated(oclMat& keypointsIn, oclMat& keypointsOut, const oclMat& keyOrder, const oclMat& duplicateOrder)
 {
     CV_Assert(keypointsIn.cols > 0);
 
     sortKeypoints_OCL(keypointsIn, keyOrder, false);
-    removeDuplicated_OCL(keypointsIn, keypointsOut, keyOrder);
+    removeDuplicated_OCL(keypointsIn, keypointsOut, duplicateOrder);
+    std::cout << "COLS3: " << keypointsOut.cols << std::endl;
 }
 
 static void retainBest(oclMat& keypoints, const int nFeatures, const oclMat& keyOrder)
@@ -709,66 +760,7 @@ static void retainBest(oclMat& keypoints, const int nFeatures, const oclMat& key
     keypoints.cols = nFeatures;
 }
 
-static void calcDescriptors_OCL(const std::vector<oclMat>& gausspyr, const oclMat& keypoints,
-                                oclMat& descriptors, const int pyrOctave, const int nOctaveLayers,
-                                const int keypointOffset, const int totalKeypoints, const int d,
-                                const int n)
-{
-    CV_Assert(nOctaveLayers <= 3);
 
-    int octaveIdx = pyrOctave*(nOctaveLayers+3);
-
-    int cn = gausspyr[octaveIdx].channels();
-    int depth = gausspyr[octaveIdx].depth();
-    int rows = gausspyr[octaveIdx].rows;
-    int cols = gausspyr[octaveIdx].cols;
-
-    size_t localThreads[3] = {1, 256, 1};
-    size_t globalThreads[3] = {divUp(totalKeypoints, localThreads[0]) * localThreads[0],
-                               1,
-                               1};
-
-    const char * const channelMap[] = { "", "", "2", "4", "4" };
-    const char * const typeMap[] = { "uchar", "char", "ushort", "short", "int", "float", "double" };
-    String buildOptions = format("-D T=%s%s", typeMap[depth], channelMap[cn]);
-
-    Context *clCxt = Context::getContext();
-    String kernelName = "calcSIFTDescriptor";
-    std::vector< std::pair<size_t, const void *> > args;
-
-    int layerStep[3] = {0,0,0};
-    for (int i = 1; i <= nOctaveLayers; i++)
-        layerStep[i-1] = gausspyr[octaveIdx+i].step / gausspyr[octaveIdx+i].elemSize();
-
-    int keypointsStep = keypoints.step / keypoints.elemSize();
-    int descriptorsStep = descriptors.step / descriptors.elemSize();
-
-    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&gausspyr[octaveIdx+1].data));
-    if (nOctaveLayers >= 2)
-        args.push_back( std::make_pair( sizeof(cl_mem), (void *)&gausspyr[octaveIdx+2].data));
-    else
-        args.push_back( std::make_pair( sizeof(cl_mem), (void *)NULL));
-    if (nOctaveLayers == 3)
-        args.push_back( std::make_pair( sizeof(cl_mem), (void *)&gausspyr[octaveIdx+3].data));
-    else
-        args.push_back( std::make_pair( sizeof(cl_mem), (void *)NULL));
-    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&keypoints.data));
-    args.push_back( std::make_pair( sizeof(cl_mem), (void *)&descriptors.data));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&nOctaveLayers));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&keypointOffset));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&totalKeypoints));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&rows));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&cols));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&layerStep[0]));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&layerStep[1]));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&layerStep[2]));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&keypointsStep));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&descriptorsStep));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&d));
-    args.push_back( std::make_pair( sizeof(cl_int), (void *)&n));
-
-    openCLExecuteKernel(clCxt, &siftprog, kernelName, globalThreads, localThreads, args, -1, -1, buildOptions.c_str());
-}
 
 static void calcDescriptors(const std::vector<oclMat>& gpyr, const oclMat& keypoints, std::vector<int>& keypointsPerOctave,
                             oclMat& descriptors, const int nOctaves, int nOctaveLayers, int firstOctave)
@@ -779,7 +771,7 @@ static void calcDescriptors(const std::vector<oclMat>& gpyr, const oclMat& keypo
     std::cout << "Descriptors: " << descriptors.rows << std::endl;
 
     for (int i = 0; i < nOctaves; i++)
-        std::cout << keypointsPerOctave[i] << std::endl;
+        std::cout << "keypointsPerOctave: " << keypointsPerOctave[i] << std::endl;
 
     if (firstOctave < 0)
     {
@@ -797,13 +789,13 @@ static void calcDescriptors(const std::vector<oclMat>& gpyr, const oclMat& keypo
         {
             int numKp = keypointsPerOctave[o-firstOctave];
             int pyrOctave = o-firstOctave;
+            float scale = 1.f/(1 << o);
 
             std::cout << "pyrOctave: " << pyrOctave << std::endl;
             std::cout << "numKp: " << numKp << std::endl;
 
-            calcDescriptors_OCL(gpyr, keypoints, descriptors, pyrOctave, nOctaveLayers, offset, numKp, d, n);
+            calcDescriptors_OCL(gpyr, keypoints, descriptors, pyrOctave, nOctaveLayers, scale, offset, numKp, d, n);
             offset += numKp;
-            //offset += keypointsPerOctave[o-firstOctave];
         }
 
         // Second pass, calculates descriptors for keypoints with negative octaves.
@@ -813,40 +805,40 @@ static void calcDescriptors(const std::vector<oclMat>& gpyr, const oclMat& keypo
         {
             int numKp = keypointsPerOctave[o];
             int pyrOctave = o;
+            float scale = static_cast<float>(1 << (o-firstOctave));
 
-//            std::cout << "offset: " << offset <<std::endl;
             std::cout << "pyrOctave: " << pyrOctave << std::endl;
             std::cout << "numKp: " << numKp << std::endl;
 
-            calcDescriptors_OCL(gpyr, keypoints, descriptors, pyrOctave, nOctaveLayers, offset, numKp, d, n);
+            calcDescriptors_OCL(gpyr, keypoints, descriptors, pyrOctave, nOctaveLayers, scale, offset, numKp, d, n);
             offset += numKp;
-            //calcDescriptors_OCL();
-            //offset += keypointsPerOctave[o];
         }
 
         std::cout << "calcDescriptors: " << (clock() - time) / (double)CLOCKS_PER_SEC << std::endl;
     }
     else
     {
+        std::cout << keypointsPerOctave.size() << std::endl;
 
+        int offset = 0;
+
+        clock_t time = clock();
+
+        // First pass, calculates descriptors for keypoints with positive octaves.
+        for (int o = 0; o < nOctaves; o++)
+        {
+            int numKp = keypointsPerOctave[o];
+            int pyrOctave = o;
+            float scale = 1.f/(1 << o);
+
+            std::cout << "pyrOctave: " << pyrOctave << std::endl;
+            std::cout << "numKp: " << numKp << std::endl;
+
+            calcDescriptors_OCL(gpyr, keypoints, descriptors, pyrOctave, nOctaveLayers, scale, offset, numKp, d, n);
+            offset += numKp;
+            //offset += keypointsPerOctave[o-firstOctave];
+        }
     }
-
-//    for( size_t i = 0; i < keypoints.size(); i++ )
-//    {
-//        KeyPoint kpt = keypoints[i];
-//        int octave, layer;
-//        float scale;
-//        unpackOctave(kpt, octave, layer, scale);
-//        CV_Assert(octave >= firstOctave && layer <= nOctaveLayers+2);
-//        float size=kpt.size*scale;
-//        Point2f ptf(kpt.pt.x*scale, kpt.pt.y*scale);
-//        const Mat& img = gpyr[(octave - firstOctave)*(nOctaveLayers + 3) + layer];
-//
-//        float angle = 360.f - kpt.angle;
-//        if(std::abs(angle - 360.f) < FLT_EPSILON)
-//            angle = 0.f;
-//        calcSIFTDescriptor(img, ptf, angle, size*0.5f, d, n, descriptors.ptr<float>((int)i));
-//    }
 }
 
 //
@@ -863,20 +855,25 @@ void SIFT_OCL::findScaleSpaceExtrema(const std::vector<oclMat>& gauss_pyr, const
     const int n = SIFT_ORI_HIST_BINS;
     float hist[n];
     int totalKeypoints = 0;
-    //std::vector<int> keypointsPerOctave(nOctaves);
     keypointsPerOctave.resize(nOctaves);
 
     clock_t extremaTime = 0, adjustTime = 0, oriTime = 0;
 
+    int extrema = 0, adjusted = 0;
+
     for( int o = 0; o < nOctaves; o++ )
-//    for( int o = 0; o < 1; o++ )
     {
         oclMat extremaKeypoints, adjustedKeypoints;
-        ensureSizeIsEnough(3,maxKeypoints,CV_32FC1,extremaKeypoints);
+
+        // Only X and Y coordinates and layer information is extracted on find extrema process
+        ensureSizeIsEnough(LAYER_ROW+1,maxKeypoints,CV_32FC1,extremaKeypoints);
         extremaKeypoints.setTo(Scalar::all(0));
-        ensureSizeIsEnough(3,maxKeypoints,CV_32FC1,adjustedKeypoints);
+
+        ensureSizeIsEnough(ROWS_COUNT,maxKeypoints,CV_32FC1,adjustedKeypoints);
         adjustedKeypoints.setTo(Scalar::all(0));
         int octaveKeypoints = 0;
+
+        std::cout << "maxKeypoints: " << maxKeypoints << std::endl;
 
         clock_t time;
 
@@ -887,9 +884,6 @@ void SIFT_OCL::findScaleSpaceExtrema(const std::vector<oclMat>& gauss_pyr, const
             const oclMat& prev = dog_pyr[idx-1];
             const oclMat& next = dog_pyr[idx+1];
 
-//            int step = (int)img.step1();
-//            int rows = img.rows, cols = img.cols;
-
             time = clock();
             findExtrema_OCL(prev, img, next, extremaKeypoints, octaveKeypoints, o, i, maxKeypoints, threshold,
                             nOctaveLayers, static_cast<float>(contrastThreshold),
@@ -897,8 +891,8 @@ void SIFT_OCL::findScaleSpaceExtrema(const std::vector<oclMat>& gauss_pyr, const
             extremaTime += clock() - time;
         }
 
-//        octaveKeypoints = std::min(octaveKeypoints, maxKeypoints);
-//        std::cout << octaveKeypoints << std::endl;
+        std::cout << "extremaOctave: " << octaveKeypoints << std::endl;
+        extrema += octaveKeypoints;
 
         time = clock();
         int adjustedOctaveKeypoints = 0;
@@ -907,6 +901,8 @@ void SIFT_OCL::findScaleSpaceExtrema(const std::vector<oclMat>& gauss_pyr, const
                                    adjustedOctaveKeypoints, o, nOctaveLayers, static_cast<float>(contrastThreshold),
                                    static_cast<float>(edgeThreshold), static_cast<float>(sigma));
         adjustTime += clock() - time;
+        std::cout << "adjustedOctave: " << adjustedOctaveKeypoints << std::endl;
+        adjusted += adjustedOctaveKeypoints;
 
         octaveKeypoints = totalKeypoints;
         if (adjustedOctaveKeypoints > 0)
@@ -914,10 +910,13 @@ void SIFT_OCL::findScaleSpaceExtrema(const std::vector<oclMat>& gauss_pyr, const
         oriTime += clock() - time;
 
         octaveKeypoints = totalKeypoints - octaveKeypoints;
+        std::cout << "octaveKeypoints: " << octaveKeypoints << std::endl;
 
         keypointsPerOctave[o] = octaveKeypoints;
     }
 
+    std::cout << "Extrema: " << extrema << std::endl;
+    std::cout << "Adjusted: " << adjusted << std::endl;
     std::cout << "extremaTime: " << extremaTime / (double)CLOCKS_PER_SEC << std::endl;
     std::cout << "adjustTime: " << adjustTime / (double)CLOCKS_PER_SEC << std::endl;
     std::cout << "oriTime: " << oriTime / (double)CLOCKS_PER_SEC << std::endl;
@@ -951,13 +950,10 @@ int cv::ocl::SIFT_OCL::defaultNorm() const
     return NORM_L2;
 }
 
-//void cv::ocl::SIFT_OCL::operator()(oclMat& image, oclMat& mask,
-//                                   std::vector<KeyPoint>& keypoints) const
-void cv::ocl::SIFT_OCL::operator()(const oclMat& image, const oclMat& mask,
-                                   oclMat& keypoints)
-{
-    //(*this)(image, mask, keypoints, oclMat());
 
+void cv::ocl::SIFT_OCL::operator()(const oclMat& image, const oclMat& mask,
+                                   oclMat& keypoints, oclMat& descriptors)
+{
     int firstOctave = -1, actualNOctaves = 0, actualNLayers = 0;
     int maxKeypoints = std::min(static_cast<int>(image.size().area() * keypointsRatio), 65535);
     std::cout << maxKeypoints << std::endl;
@@ -972,7 +968,7 @@ void cv::ocl::SIFT_OCL::operator()(const oclMat& image, const oclMat& mask,
         CV_Error( Error::StsBadArg, "mask has incorrect type (!=CV_8UC1)" );
 
     if( nOctaveLayers > 3 )
-        CV_Error( Error::StsBadArg, "current implementation supports only a maximum of 3 octave layers" );
+        CV_Error( Error::StsBadArg, "current implementation supports a maximum of 3 octave layers" );
 
 //    if( useProvidedKeypoints )
 //    {
@@ -997,11 +993,6 @@ void cv::ocl::SIFT_OCL::operator()(const oclMat& image, const oclMat& mask,
     std::vector<oclMat> gpyr, dogpyr;
     int nOctaves = actualNOctaves > 0 ? actualNOctaves : cvRound(std::log( (double)std::min( base.cols, base.rows ) ) / std::log(2.) - 2) - firstOctave;
 
-//    Mat firstlevel(base);
-//    firstlevel.convertTo(firstlevel, CV_8U);
-//    imshow("firstlevel", firstlevel);
-//    waitKey(0);
-
     //double t, tf = getTickFrequency();
     //t = (double)getTickCount();
     clock_t pyrTime = clock();
@@ -1009,20 +1000,20 @@ void cv::ocl::SIFT_OCL::operator()(const oclMat& image, const oclMat& mask,
     buildDoGPyramid(gpyr, dogpyr);
     std::cout << "pyrTime: " << pyrTime / (double)CLOCKS_PER_SEC << std::endl;
 
-    //t = (double)getTickCount() - t;
-    //printf("pyramid construction time: %g\n", t*1000./tf);
-
     std::vector<int> keypointsPerOctave;
     findScaleSpaceExtrema(gpyr, dogpyr, mask, keypoints, keypointsPerOctave, maxKeypoints, firstOctave);
 
+    // Define keypoint
     const int key_elements = 6;
     int keys[key_elements] = {X_ROW, Y_ROW, SIZE_ROW, ANGLE_ROW, RESPONSE_ROW, OCTAVE_ROW};
     oclMat keyOrder(1,key_elements,CV_32SC1,keys);
-//    sortKeypoints_OCL(keypoints, keyOrder, false);
+    const int duplicate_elements = 4;
+    int duplicate[duplicate_elements] = {X_ROW, Y_ROW, ANGLE_ROW, SIZE_ROW};
+    oclMat duplicateOrder(1,duplicate_elements,CV_32SC1,duplicate);
 
     oclMat tmpKeypoints;
-//    removeDuplicated(keypoints, tmpKeypoints, keyOrder);
-    std::cout << tmpKeypoints.cols << std::endl;
+    removeDuplicated(keypoints, tmpKeypoints, keyOrder, duplicateOrder);
+    std::cout << "Non-duplicated: " << tmpKeypoints.cols << std::endl;
 
     if (nfeatures > 0)
     {
@@ -1032,17 +1023,19 @@ void cv::ocl::SIFT_OCL::operator()(const oclMat& image, const oclMat& mask,
         retainBest(tmpKeypoints, nfeatures, respOrder);
     }
 
-//    tmpKeypoints.copyTo(keypoints);
-    std::cout << "Keypoints: " << keypoints.cols << std::endl;
+    // Copy non-duplicated (and possibly only best retained features) to final keypoints matrix
+    tmpKeypoints.copyTo(keypoints);
+    tmpKeypoints.release();
 
     // if( _descriptors.needed() )
-    // Reorder keypoints by octaves, enabling the descriptor calculator kernel to be run
-    // individually for each octave
+
 //    const int octv_elements = 1;
 //    int octv_keys[octv_elements] = {OCTAVE_ROW};
 //    oclMat octvOrder(1,octv_elements,CV_32SC1,octv_keys);
 //    sortKeypoints_OCL(keypoints, octvOrder, false);
 
+    // Reorder keypoints by octaves, allowing the descriptor calculator kernel to be run
+    // individually for each octave
     const int octv_elements = 3;
     int octv_keys[octv_elements] = {OCTAVE_ROW, X_ROW, Y_ROW};
     oclMat octvOrder(1,octv_elements,CV_32SC1,octv_keys);
@@ -1050,25 +1043,29 @@ void cv::ocl::SIFT_OCL::operator()(const oclMat& image, const oclMat& mask,
 
     std::cout << "Keypoints: " << keypoints.cols << std::endl;
 
-    oclMat descriptors;
     int dsize = descriptorSize();
     ensureSizeIsEnough(keypoints.cols, dsize, CV_32FC1, descriptors);
 
     calcDescriptors(gpyr, keypoints, keypointsPerOctave, descriptors, nOctaves, nOctaveLayers, firstOctave);
-    Mat desc;
-    desc = descriptors;
-    Mat kp = keypoints;
-    std::cout << kp.at<float>(X_ROW,11) << " " << kp.at<float>(Y_ROW,11) << " " << kp.at<float>(ANGLE_ROW,11) << std::endl;
-    std::cout << "[";
-    for (int i = 0; i < desc.cols; i++)
-        std::cout << desc.at<float>(11,i) << ", ";
-    std::cout << "]" << std::endl;
 
-    // TODO: Check this
-//    for (int i = 0; i < desc.rows; i++)
-//        for (int j = 0; j < desc.cols; j++)
-//            if (desc.at<float>(i,j) > 200)
-//                std::cout << i << " " << desc.at<float>(i,j) << std::endl;
+//    Mat desc;
+//    desc = descriptors;
+//    Mat kp = keypoints;
+//
+//    for (int j = 8; j < 12; j++)
+//    {
+//        std::cout << kp.at<float>(X_ROW,j) << " " << kp.at<float>(Y_ROW,j) << " " << kp.at<float>(ANGLE_ROW,j) << std::endl;
+//        std::cout << "[";
+//        for (int i = 0; i < desc.cols; i++)
+//            std::cout << desc.at<float>(j,i) << ", ";
+//        std::cout << "]" << std::endl;
+//    }
+////
+//    std::cout << kp.at<float>(X_ROW,288) << " " << kp.at<float>(Y_ROW,288) << " " << kp.at<float>(ANGLE_ROW,288) << std::endl;
+//    std::cout << "[";
+//    for (int i = 0; i < desc.cols; i++)
+//        std::cout << desc.at<float>(288,i) << ", ";
+//    std::cout << "]" << std::endl;
 
 //    Mat tmp;
 //    tmp = keypoints;
@@ -1129,9 +1126,9 @@ void cv::ocl::SIFT_OCL::operator()(const oclMat& image, const oclMat& mask,
 ////    }
 }
 
-void cv::ocl::SIFT_OCL::operator()(const oclMat& img, const oclMat& mask, std::vector<KeyPoint>& keypoints)
+void cv::ocl::SIFT_OCL::operator()(const oclMat& img, const oclMat& mask, std::vector<KeyPoint>& keypoints, oclMat& descriptors)
 {
-    (*this)(img, mask, d_keypoints_);
+    (*this)(img, mask, d_keypoints_, descriptors);
     downloadKeyPoints(d_keypoints_, keypoints);
 }
 
@@ -1160,6 +1157,7 @@ void cv::ocl::SIFT_OCL::convertKeyPoints(const Mat &d_keypoints, std::vector<Key
 
     const float* x_ptr = d_keypoints.ptr<float>(X_ROW);
     const float* y_ptr = d_keypoints.ptr<float>(Y_ROW);
+    const float* layer_ptr = d_keypoints.ptr<float>(LAYER_ROW);
     const float* response_ptr = d_keypoints.ptr<float>(RESPONSE_ROW);
     const float* angle_ptr = d_keypoints.ptr<float>(ANGLE_ROW);
     const float* octave_ptr = d_keypoints.ptr<float>(OCTAVE_ROW);
@@ -1175,13 +1173,17 @@ void cv::ocl::SIFT_OCL::convertKeyPoints(const Mat &d_keypoints, std::vector<Key
         kp.pt.y = y_ptr[i];
         kp.response = response_ptr[i];
         kp.angle = angle_ptr[i];
-        kp.octave = static_cast<int>(octave_ptr[i]);
         kp.size = size_ptr[i];
+
+        // Pack keypoint octave and store
+        int octave = static_cast<int>(octave_ptr[i]);
+        octave |= (static_cast<int>(layer_ptr[i]) << 8);
+        kp.octave = octave;
 
         keypoints[i] = kp;
     }
 }
-//
+
 //void cv::ocl::ORB_OCL::operator()(const oclMat& image, const oclMat& mask, oclMat& keypoints)
 //{
 //    buildScalePyramids(image, mask);
